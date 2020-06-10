@@ -2167,6 +2167,10 @@ void OperationPrinter::print(Operation *op) {
 }
 
 void OperationPrinter::printOperation(Operation *op) {
+  // print UID (Jhe-Yu Liou)
+  if (!op->getUID().empty())
+    os << '@' << op->getUID() << ' ';
+
   if (size_t numResults = op->getNumResults()) {
     auto printResultGroup = [&](size_t resultNo, size_t resultCount) {
       printValueID(op->getResult(resultNo), /*printResultNo=*/false);

@@ -1,4 +1,5 @@
 # MLIR project.
+# set(CMAKE_BUILD_TYPE Debug)
 set(MLIR_MAIN_SRC_DIR     ${CMAKE_CURRENT_SOURCE_DIR}  )
 set(MLIR_MAIN_INCLUDE_DIR ${MLIR_MAIN_SRC_DIR}/include )
 

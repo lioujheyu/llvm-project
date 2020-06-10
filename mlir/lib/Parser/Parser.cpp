@@ -3825,6 +3825,14 @@ ParseResult OperationParser::parseOperation() {
   auto loc = getToken().getLoc();
   SmallVector<ResultRecord, 1> resultIDs;
   size_t numExpectedResults = 0;
+
+  std::string uid;
+  if (getToken().is(Token::at_identifier)) {
+    //parse uid (Jhe-Yu Liou)
+    uid = getToken().getSpelling().drop_front().str();
+    consumeToken(Token::at_identifier);
+  }
+
   if (getToken().is(Token::percent_identifier)) {
     // Parse the group of result ids.
     auto parseNextResult = [&]() -> ParseResult {
@@ -3869,6 +3877,9 @@ ParseResult OperationParser::parseOperation() {
     op = parseGenericOperation();
   else
     return emitError("expected operation name in quotes");
+
+  if(!uid.empty())
+    op->setUID(uid);
 
   // If parsing of the basic operation failed, then this whole thing fails.
   if (!op)

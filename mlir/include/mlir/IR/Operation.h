@@ -105,6 +105,9 @@ public:
   /// Set the source location the operation was defined or derived from.
   void setLoc(Location loc) { location = loc; }
 
+  std::string getUID() {return uid;}
+  void setUID(std::string id) {uid = id;}
+
   /// Returns the region to which the instruction belongs. Returns nullptr if
   /// the instruction is unlinked.
   Region *getParentRegion();
@@ -670,6 +673,9 @@ private:
   /// This holds information about the source location the operation was defined
   /// or derived from.
   Location location;
+
+  /// This holds the Unique ID in string for each operation (Jhe-Yu Liou)
+  std::string uid;
 
   /// Relative order of this operation in its parent block. Used for
   /// O(1) local dominance checks between operations.
