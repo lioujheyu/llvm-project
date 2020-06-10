@@ -6,7 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-// RUN: mlir-edsc-builder-api-test | FileCheck %s -dump-input-on-failure
+// RUN: mlir-edsc-builder-api-test | FileCheck %s
 
 #include "mlir/Dialect/Affine/EDSC/Intrinsics.h"
 #include "mlir/Dialect/Linalg/EDSC/Builders.h"
@@ -510,7 +510,7 @@ TEST_FUNC(operator_and) {
   // CHECK-LABEL: @operator_and
   //       CHECK: [[ARG0:%.*]]: i1, [[ARG1:%.*]]: i1
   //       CHECK: [[AND:%.*]] = and [[ARG0]], [[ARG1]]
-  //       CHECK: [[TRUE:%.*]] = constant 1 : i1
+  //       CHECK: [[TRUE:%.*]] = constant true
   //       CHECK: subi [[TRUE]], [[AND]] : i1
   f.print(llvm::outs());
   f.erase();
