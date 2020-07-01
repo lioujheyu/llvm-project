@@ -595,6 +595,8 @@ public:
   /// the full module.
   OpPrintingFlags &useLocalScope();
 
+  OpPrintingFlags &enableUID();
+
   /// Return if the given ElementsAttr should be elided.
   bool shouldElideElementsAttr(ElementsAttr attr) const;
 
@@ -613,6 +615,8 @@ public:
   /// Return if the printer should use local scope when dumping the IR.
   bool shouldUseLocalScope() const;
 
+  bool shouldPrintUID() const;
+
 private:
   /// Elide large elements attributes if the number of elements is larger than
   /// the upper limit.
@@ -627,6 +631,8 @@ private:
 
   /// Print operations with numberings local to the current operation.
   bool printLocalScope : 1;
+
+  bool printUID : 1;
 };
 
 //===----------------------------------------------------------------------===//

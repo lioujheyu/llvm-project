@@ -111,7 +111,8 @@ void mlir::registerAsmPrinterCLOptions() {
 /// Initialize the printing flags with default supplied by the cl::opts above.
 OpPrintingFlags::OpPrintingFlags()
     : printDebugInfoFlag(false), printDebugInfoPrettyFormFlag(false),
-      printGenericOpFormFlag(false), printLocalScope(false) {
+      printGenericOpFormFlag(false), printLocalScope(false),
+      printUID(false) {
   // Initialize based upon command line options, if they are available.
   if (!clOptions.isConstructed())
     return;
@@ -155,6 +156,11 @@ OpPrintingFlags &OpPrintingFlags::useLocalScope() {
   return *this;
 }
 
+OpPrintingFlags &OpPrintingFlags::enableUID() {
+  printUID = true;
+  return *this;
+}
+
 /// Return if the given ElementsAttr should be elided.
 bool OpPrintingFlags::shouldElideElementsAttr(ElementsAttr attr) const {
   return elementsAttrElementLimit.hasValue() &&
@@ -183,6 +189,8 @@ bool OpPrintingFlags::shouldPrintGenericOpForm() const {
 
 /// Return if the printer should use local scope when dumping the IR.
 bool OpPrintingFlags::shouldUseLocalScope() const { return printLocalScope; }
+
+bool OpPrintingFlags::shouldPrintUID() const { return printUID; }
 
 /// Returns true if an ElementsAttr with the given number of elements should be
 /// printed with hex.
@@ -2170,8 +2178,10 @@ void OperationPrinter::print(Operation *op) {
 
 void OperationPrinter::printOperation(Operation *op) {
   // print UID (Jhe-Yu Liou)
-  if (!op->getUID().empty())
-    os << '@' << op->getUID() << ' ';
+  if (printerFlags.shouldPrintUID()) {
+    if (!op->getUID().empty())
+      os << '@' << op->getUID() << ' ';
+  }
 
   if (size_t numResults = op->getNumResults()) {
     auto printResultGroup = [&](size_t resultNo, size_t resultCount) {
