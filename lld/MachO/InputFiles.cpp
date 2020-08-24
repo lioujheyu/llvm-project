@@ -137,7 +137,8 @@ void InputFile::parseSections(ArrayRef<section_64> sections) {
     isec->file = this;
     isec->name = StringRef(sec.sectname, strnlen(sec.sectname, 16));
     isec->segname = StringRef(sec.segname, strnlen(sec.segname, 16));
-    isec->data = {buf + sec.offset, static_cast<size_t>(sec.size)};
+    isec->data = {isZeroFill(sec.flags) ? nullptr : buf + sec.offset,
+                  static_cast<size_t>(sec.size)};
     if (sec.align >= 32)
       error("alignment " + std::to_string(sec.align) + " of section " +
             isec->name + " is too large");
@@ -178,15 +179,13 @@ void InputFile::parseRelocations(const section_64 &sec,
     Reloc r;
     r.type = rel.r_type;
     r.pcrel = rel.r_pcrel;
+    r.length = rel.r_length;
     uint64_t rawAddend = target->getImplicitAddend(mb, sec, rel);
 
     if (rel.r_extern) {
       r.target = symbols[rel.r_symbolnum];
       r.addend = rawAddend;
     } else {
-      if (!rel.r_pcrel)
-        fatal("TODO: Only pcrel section relocations are supported");
-
       if (rel.r_symbolnum == 0 || rel.r_symbolnum > subsections.size())
         fatal("invalid section index in relocation for offset " +
               std::to_string(r.offset) + " in section " + sec.sectname +
@@ -194,14 +193,19 @@ void InputFile::parseRelocations(const section_64 &sec,
 
       SubsectionMap &targetSubsecMap = subsections[rel.r_symbolnum - 1];
       const section_64 &targetSec = sectionHeaders[rel.r_symbolnum - 1];
-      // The implicit addend for pcrel section relocations is the pcrel offset
-      // in terms of the addresses in the input file. Here we adjust it so that
-      // it describes the offset from the start of the target section.
-      // TODO: Figure out what to do for non-pcrel section relocations.
-      // TODO: The offset of 4 is probably not right for ARM64, nor for
-      //       relocations with r_length != 2.
-      uint32_t targetOffset =
-          sec.addr + rel.r_address + 4 + rawAddend - targetSec.addr;
+      uint32_t targetOffset;
+      if (rel.r_pcrel) {
+        // The implicit addend for pcrel section relocations is the pcrel offset
+        // in terms of the addresses in the input file. Here we adjust it so
+        // that it describes the offset from the start of the target section.
+        // TODO: The offset of 4 is probably not right for ARM64, nor for
+        //       relocations with r_length != 2.
+        targetOffset =
+            sec.addr + rel.r_address + 4 + rawAddend - targetSec.addr;
+      } else {
+        // The addend for a non-pcrel relocation is its absolute address.
+        targetOffset = rawAddend - targetSec.addr;
+      }
       r.target = findContainingSubsection(targetSubsecMap, &targetOffset);
       r.addend = targetOffset;
     }
@@ -224,10 +228,9 @@ void InputFile::parseSymbols(ArrayRef<structs::nlist_64> nList,
     StringRef name = strtab + sym.n_strx;
     if (sym.n_type & N_EXT)
       // Global defined symbol
-      return symtab->addDefined(name, isec, value);
-    else
-      // Local defined symbol
-      return make<Defined>(name, isec, value);
+      return symtab->addDefined(name, isec, value, sym.n_desc & N_WEAK_DEF);
+    // Local defined symbol
+    return make<Defined>(name, isec, value, sym.n_desc & N_WEAK_DEF);
   };
 
   for (size_t i = 0, n = nList.size(); i < n; ++i) {
@@ -298,6 +301,18 @@ void InputFile::parseSymbols(ArrayRef<structs::nlist_64> nList,
   }
 }
 
+OpaqueFile::OpaqueFile(MemoryBufferRef mb, StringRef segName,
+                       StringRef sectName)
+    : InputFile(OpaqueKind, mb) {
+  InputSection *isec = make<InputSection>();
+  isec->file = this;
+  isec->name = sectName.take_front(16);
+  isec->segname = segName.take_front(16);
+  const auto *buf = reinterpret_cast<const uint8_t *>(mb.getBufferStart());
+  isec->data = {buf, mb.getBufferSize()};
+  subsections.push_back({{0, isec}});
+}
+
 ObjFile::ObjFile(MemoryBufferRef mb) : InputFile(ObjKind, mb) {
   auto *buf = reinterpret_cast<const uint8_t *>(mb.getBufferStart());
   auto *hdr = reinterpret_cast<const mach_header_64 *>(mb.getBufferStart());
@@ -347,7 +362,10 @@ DylibFile::DylibFile(MemoryBufferRef mb, DylibFile *umbrella)
     auto *c = reinterpret_cast<const dyld_info_command *>(cmd);
     parseTrie(buf + c->export_off, c->export_size,
               [&](const Twine &name, uint64_t flags) {
-                symbols.push_back(symtab->addDylib(saver.save(name), umbrella));
+                bool isWeakDef = flags & EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION;
+                bool isTlv = flags & EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL;
+                symbols.push_back(symtab->addDylib(saver.save(name), umbrella,
+                                                   isWeakDef, isTlv));
               });
   } else {
     error("LC_DYLD_INFO_ONLY not found in " + getName());
@@ -378,33 +396,46 @@ DylibFile::DylibFile(MemoryBufferRef mb, DylibFile *umbrella)
   }
 }
 
-DylibFile::DylibFile(std::shared_ptr<llvm::MachO::InterfaceFile> interface,
-                     DylibFile *umbrella)
+DylibFile::DylibFile(const InterfaceFile &interface, DylibFile *umbrella)
     : InputFile(DylibKind, MemoryBufferRef()) {
   if (umbrella == nullptr)
     umbrella = this;
 
-  dylibName = saver.save(interface->getInstallName());
+  dylibName = saver.save(interface.getInstallName());
+  auto addSymbol = [&](const Twine &name) -> void {
+    symbols.push_back(symtab->addDylib(saver.save(name), umbrella,
+                                       /*isWeakDef=*/false,
+                                       /*isTlv=*/false));
+  };
   // TODO(compnerd) filter out symbols based on the target platform
-  for (const auto symbol : interface->symbols())
-    if (symbol->getArchitectures().has(config->arch))
-      symbols.push_back(
-          symtab->addDylib(saver.save(symbol->getName()), umbrella));
+  // TODO: handle weak defs, thread locals
+  for (const auto symbol : interface.symbols()) {
+    if (!symbol->getArchitectures().has(config->arch))
+      continue;
+
+    switch (symbol->getKind()) {
+    case SymbolKind::GlobalSymbol:
+      addSymbol(symbol->getName());
+      break;
+    case SymbolKind::ObjectiveCClass:
+      // XXX ld64 only creates these symbols when -ObjC is passed in. We may
+      // want to emulate that.
+      addSymbol("_OBJC_CLASS_$_" + symbol->getName());
+      addSymbol("_OBJC_METACLASS_$_" + symbol->getName());
+      break;
+    case SymbolKind::ObjectiveCClassEHType:
+      addSymbol("_OBJC_EHTYPE_$_" + symbol->getName());
+      break;
+    case SymbolKind::ObjectiveCInstanceVariable:
+      addSymbol("_OBJC_IVAR_$_" + symbol->getName());
+      break;
+    }
+  }
   // TODO(compnerd) properly represent the hierarchy of the documents as it is
   // in theory possible to have re-exported dylibs from re-exported dylibs which
   // should be parent'ed to the child.
-  for (auto document : interface->documents())
-    reexported.push_back(make<DylibFile>(document, umbrella));
-}
-
-DylibFile::DylibFile() : InputFile(DylibKind, MemoryBufferRef()) {}
-
-DylibFile *DylibFile::createLibSystemMock() {
-  auto *file = make<DylibFile>();
-  file->mb = MemoryBufferRef("", "/usr/lib/libSystem.B.dylib");
-  file->dylibName = "/usr/lib/libSystem.B.dylib";
-  file->symbols.push_back(symtab->addDylib("dyld_stub_binder", file));
-  return file;
+  for (const std::shared_ptr<InterfaceFile> &intf : interface.documents())
+    reexported.push_back(make<DylibFile>(*intf, umbrella));
 }
 
 ArchiveFile::ArchiveFile(std::unique_ptr<llvm::object::Archive> &&f)

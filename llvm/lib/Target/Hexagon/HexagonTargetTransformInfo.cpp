@@ -21,6 +21,7 @@
 #include "llvm/IR/User.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Transforms/Utils/LoopPeel.h"
 #include "llvm/Transforms/Utils/UnrollLoop.h"
 
 using namespace llvm;
@@ -78,12 +79,17 @@ HexagonTTIImpl::getPopcntSupport(unsigned IntTyWidthInBit) const {
 void HexagonTTIImpl::getUnrollingPreferences(Loop *L, ScalarEvolution &SE,
                                              TTI::UnrollingPreferences &UP) {
   UP.Runtime = UP.Partial = true;
+}
+
+void HexagonTTIImpl::getPeelingPreferences(Loop *L, ScalarEvolution &SE,
+                                           TTI::PeelingPreferences &PP) {
+  BaseT::getPeelingPreferences(L, SE, PP);
   // Only try to peel innermost loops with small runtime trip counts.
   if (L && L->empty() && canPeel(L) &&
       SE.getSmallConstantTripCount(L) == 0 &&
       SE.getSmallConstantMaxTripCount(L) > 0 &&
       SE.getSmallConstantMaxTripCount(L) <= 5) {
-    UP.PeelCount = 2;
+    PP.PeelCount = 2;
   }
 }
 
@@ -108,7 +114,7 @@ unsigned HexagonTTIImpl::getRegisterBitWidth(bool Vector) const {
 }
 
 unsigned HexagonTTIImpl::getMinVectorRegisterBitWidth() const {
-  return useHVX() ? ST.getVectorLength()*8 : 0;
+  return useHVX() ? ST.getVectorLength()*8 : 32;
 }
 
 unsigned HexagonTTIImpl::getMinimumVF(unsigned ElemWidth) const {
@@ -200,9 +206,10 @@ unsigned HexagonTTIImpl::getMemoryOpCost(unsigned Opcode, Type *Src,
                                 CostKind, I);
 }
 
-unsigned HexagonTTIImpl::getMaskedMemoryOpCost(unsigned Opcode,
-      Type *Src, unsigned Alignment, unsigned AddressSpace,
-      TTI::TargetCostKind CostKind) {
+unsigned HexagonTTIImpl::getMaskedMemoryOpCost(unsigned Opcode, Type *Src,
+                                               Align Alignment,
+                                               unsigned AddressSpace,
+                                               TTI::TargetCostKind CostKind) {
   return BaseT::getMaskedMemoryOpCost(Opcode, Src, Alignment, AddressSpace,
                                       CostKind);
 }
@@ -213,18 +220,16 @@ unsigned HexagonTTIImpl::getShuffleCost(TTI::ShuffleKind Kind, Type *Tp,
 }
 
 unsigned HexagonTTIImpl::getGatherScatterOpCost(
-    unsigned Opcode, Type *DataTy, Value *Ptr, bool VariableMask,
-    unsigned Alignment, TTI::TargetCostKind CostKind,
-    const Instruction *I) {
+    unsigned Opcode, Type *DataTy, const Value *Ptr, bool VariableMask,
+    Align Alignment, TTI::TargetCostKind CostKind, const Instruction *I) {
   return BaseT::getGatherScatterOpCost(Opcode, DataTy, Ptr, VariableMask,
                                        Alignment, CostKind, I);
 }
 
-unsigned HexagonTTIImpl::getInterleavedMemoryOpCost(unsigned Opcode,
-      Type *VecTy, unsigned Factor, ArrayRef<unsigned> Indices,
-      unsigned Alignment, unsigned AddressSpace,
-      TTI::TargetCostKind CostKind, bool UseMaskForCond,
-      bool UseMaskForGaps) {
+unsigned HexagonTTIImpl::getInterleavedMemoryOpCost(
+    unsigned Opcode, Type *VecTy, unsigned Factor, ArrayRef<unsigned> Indices,
+    Align Alignment, unsigned AddressSpace, TTI::TargetCostKind CostKind,
+    bool UseMaskForCond, bool UseMaskForGaps) {
   if (Indices.size() != Factor || UseMaskForCond || UseMaskForGaps)
     return BaseT::getInterleavedMemoryOpCost(Opcode, VecTy, Factor, Indices,
                                              Alignment, AddressSpace,
@@ -250,6 +255,12 @@ unsigned HexagonTTIImpl::getArithmeticInstrCost(
     TTI::OperandValueKind Opd2Info, TTI::OperandValueProperties Opd1PropInfo,
     TTI::OperandValueProperties Opd2PropInfo, ArrayRef<const Value *> Args,
     const Instruction *CxtI) {
+  // TODO: Handle more cost kinds.
+  if (CostKind != TTI::TCK_RecipThroughput)
+    return BaseT::getArithmeticInstrCost(Opcode, Ty, CostKind, Opd1Info,
+                                         Opd2Info, Opd1PropInfo,
+                                         Opd2PropInfo, Args, CxtI);
+
   if (Ty->isVectorTy()) {
     std::pair<int, MVT> LT = TLI.getTypeLegalizationCost(DL, Ty);
     if (LT.second.isFloatingPoint())
@@ -260,7 +271,9 @@ unsigned HexagonTTIImpl::getArithmeticInstrCost(
 }
 
 unsigned HexagonTTIImpl::getCastInstrCost(unsigned Opcode, Type *DstTy,
-      Type *SrcTy, TTI::TargetCostKind CostKind, const Instruction *I) {
+                                          Type *SrcTy, TTI::CastContextHint CCH,
+                                          TTI::TargetCostKind CostKind,
+                                          const Instruction *I) {
   if (SrcTy->isFPOrFPVectorTy() || DstTy->isFPOrFPVectorTy()) {
     unsigned SrcN = SrcTy->isFPOrFPVectorTy() ? getTypeNumElements(SrcTy) : 0;
     unsigned DstN = DstTy->isFPOrFPVectorTy() ? getTypeNumElements(DstTy) : 0;

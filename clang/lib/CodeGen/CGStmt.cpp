@@ -1070,6 +1070,19 @@ void CodeGenFunction::EmitReturnOfRValue(RValue RV, QualType Ty) {
   EmitBranchThroughCleanup(ReturnBlock);
 }
 
+namespace {
+// RAII struct used to save and restore a return statment's result expression.
+struct SaveRetExprRAII {
+  SaveRetExprRAII(const Expr *RetExpr, CodeGenFunction &CGF)
+      : OldRetExpr(CGF.RetExpr), CGF(CGF) {
+    CGF.RetExpr = RetExpr;
+  }
+  ~SaveRetExprRAII() { CGF.RetExpr = OldRetExpr; }
+  const Expr *OldRetExpr;
+  CodeGenFunction &CGF;
+};
+} // namespace
+
 /// EmitReturnStmt - Note that due to GCC extensions, this can have an operand
 /// if the function returns void, or may be missing one if the function returns
 /// non-void.  Fun stuff :).
@@ -1095,16 +1108,19 @@ void CodeGenFunction::EmitReturnStmt(const ReturnStmt &S) {
   // Emit the result value, even if unused, to evaluate the side effects.
   const Expr *RV = S.getRetValue();
 
-  // Treat block literals in a return expression as if they appeared
-  // in their own scope.  This permits a small, easily-implemented
-  // exception to our over-conservative rules about not jumping to
-  // statements following block literals with non-trivial cleanups.
-  RunCleanupsScope cleanupScope(*this);
-  if (const FullExpr *fe = dyn_cast_or_null<FullExpr>(RV)) {
-    enterFullExpression(fe);
-    RV = fe->getSubExpr();
-  }
+  // Record the result expression of the return statement. The recorded
+  // expression is used to determine whether a block capture's lifetime should
+  // end at the end of the full expression as opposed to the end of the scope
+  // enclosing the block expression.
+  //
+  // This permits a small, easily-implemented exception to our over-conservative
+  // rules about not jumping to statements following block literals with
+  // non-trivial cleanups.
+  SaveRetExprRAII SaveRetExpr(RV, *this);
 
+  RunCleanupsScope cleanupScope(*this);
+  if (const auto *EWC = dyn_cast_or_null<ExprWithCleanups>(RV))
+    RV = EWC->getSubExpr();
   // FIXME: Clean this up by using an LValue for ReturnTemp,
   // EmitStoreThroughLValue, and EmitAnyExpr.
   // Check if the NRVO candidate was not globalized in OpenMP mode.
@@ -1938,12 +1954,16 @@ static llvm::MDNode *getAsmSrcLocInfo(const StringLiteral *Str,
 }
 
 static void UpdateAsmCallInst(llvm::CallBase &Result, bool HasSideEffect,
-                              bool ReadOnly, bool ReadNone, const AsmStmt &S,
+                              bool ReadOnly, bool ReadNone, bool NoMerge,
+                              const AsmStmt &S,
                               const std::vector<llvm::Type *> &ResultRegTypes,
                               CodeGenFunction &CGF,
                               std::vector<llvm::Value *> &RegResults) {
   Result.addAttribute(llvm::AttributeList::FunctionIndex,
                       llvm::Attribute::NoUnwind);
+  if (NoMerge)
+    Result.addAttribute(llvm::AttributeList::FunctionIndex,
+                        llvm::Attribute::NoMerge);
   // Attach readnone and readonly attributes.
   if (!HasSideEffect) {
     if (ReadNone)
@@ -2318,12 +2338,14 @@ void CodeGenFunction::EmitAsmStmt(const AsmStmt &S) {
         Builder.CreateCallBr(IA, Fallthrough, Transfer, Args);
     EmitBlock(Fallthrough);
     UpdateAsmCallInst(cast<llvm::CallBase>(*Result), HasSideEffect, ReadOnly,
-                      ReadNone, S, ResultRegTypes, *this, RegResults);
+                      ReadNone, InNoMergeAttributedStmt, S, ResultRegTypes,
+                      *this, RegResults);
   } else {
     llvm::CallInst *Result =
         Builder.CreateCall(IA, Args, getBundlesForFunclet(IA));
     UpdateAsmCallInst(cast<llvm::CallBase>(*Result), HasSideEffect, ReadOnly,
-                      ReadNone, S, ResultRegTypes, *this, RegResults);
+                      ReadNone, InNoMergeAttributedStmt, S, ResultRegTypes,
+                      *this, RegResults);
   }
 
   assert(RegResults.size() == ResultRegTypes.size());
@@ -2396,8 +2418,7 @@ LValue CodeGenFunction::InitCapturedStruct(const CapturedStmt &S) {
        I != E; ++I, ++CurField) {
     LValue LV = EmitLValueForFieldInitialization(SlotLV, *CurField);
     if (CurField->hasCapturedVLAType()) {
-      auto VAT = CurField->getCapturedVLAType();
-      EmitStoreThroughLValue(RValue::get(VLASizeMap[VAT->getSizeExpr()]), LV);
+      EmitLambdaVLACapture(CurField->getCapturedVLAType(), LV);
     } else {
       EmitInitializerForField(*CurField, LV, *I);
     }

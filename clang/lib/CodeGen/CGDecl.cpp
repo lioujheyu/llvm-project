@@ -100,11 +100,19 @@ void CodeGenFunction::EmitDecl(const Decl &D) {
   case Decl::ObjCTypeParam:
   case Decl::Binding:
     llvm_unreachable("Declaration should not be in declstmts!");
-  case Decl::Function:  // void X();
   case Decl::Record:    // struct/union/class X;
-  case Decl::Enum:      // enum X;
-  case Decl::EnumConstant: // enum ? { X = ? }
   case Decl::CXXRecord: // struct/union/class X; [C++]
+    if (CGDebugInfo *DI = getDebugInfo())
+      if (cast<RecordDecl>(D).getDefinition())
+        DI->EmitAndRetainType(getContext().getRecordType(cast<RecordDecl>(&D)));
+    return;
+  case Decl::Enum:      // enum X;
+    if (CGDebugInfo *DI = getDebugInfo())
+      if (cast<EnumDecl>(D).getDefinition())
+        DI->EmitAndRetainType(getContext().getEnumType(cast<EnumDecl>(&D)));
+    return;
+  case Decl::Function:     // void X();
+  case Decl::EnumConstant: // enum ? { X = ? }
   case Decl::StaticAssert: // static_assert(X, ""); [C++0x]
   case Decl::Label:        // __label__ x;
   case Decl::Import:
@@ -157,12 +165,11 @@ void CodeGenFunction::EmitDecl(const Decl &D) {
 
   case Decl::Typedef:      // typedef int X;
   case Decl::TypeAlias: {  // using X = int; [C++0x]
-    const TypedefNameDecl &TD = cast<TypedefNameDecl>(D);
-    QualType Ty = TD.getUnderlyingType();
-
+    QualType Ty = cast<TypedefNameDecl>(D).getUnderlyingType();
+    if (CGDebugInfo *DI = getDebugInfo())
+      DI->EmitAndRetainType(Ty);
     if (Ty->isVariablyModifiedType())
       EmitVariablyModifiedType(Ty);
-
     return;
   }
   }
@@ -762,10 +769,8 @@ void CodeGenFunction::EmitScalarInit(const Expr *init, const ValueDecl *D,
 
   // If we're emitting a value with lifetime, we have to do the
   // initialization *before* we leave the cleanup scopes.
-  if (const FullExpr *fe = dyn_cast<FullExpr>(init)) {
-    enterFullExpression(fe);
-    init = fe->getSubExpr();
-  }
+  if (const ExprWithCleanups *EWC = dyn_cast<ExprWithCleanups>(init))
+    init = EWC->getSubExpr();
   CodeGenFunction::RunCleanupsScope Scope(*this);
 
   // We have to maintain the illusion that the variable is
@@ -1402,10 +1407,15 @@ CodeGenFunction::EmitAutoVarAlloca(const VarDecl &D) {
 
   Address address = Address::invalid();
   Address AllocaAddr = Address::invalid();
-  Address OpenMPLocalAddr =
-      getLangOpts().OpenMP
-          ? CGM.getOpenMPRuntime().getAddressOfLocalVariable(*this, &D)
-          : Address::invalid();
+  Address OpenMPLocalAddr = Address::invalid();
+  if (CGM.getLangOpts().OpenMPIRBuilder)
+    OpenMPLocalAddr = OMPBuilderCBHelpers::getAddressOfLocalVariable(*this, &D);
+  else
+    OpenMPLocalAddr =
+        getLangOpts().OpenMP
+            ? CGM.getOpenMPRuntime().getAddressOfLocalVariable(*this, &D)
+            : Address::invalid();
+
   bool NRVO = getLangOpts().ElideConstructors && D.isNRVOVariable();
 
   if (getLangOpts().OpenMP && OpenMPLocalAddr.isValid()) {
@@ -1877,9 +1887,7 @@ void CodeGenFunction::EmitAutoVarInit(const AutoVarEmission &emission) {
 ///
 /// \param init the initializing expression
 /// \param D the object to act as if we're initializing
-/// \param loc the address to initialize; its type is a pointer
-///   to the LLVM mapping of the object's type
-/// \param alignment the alignment of the address
+/// \param lvalue the lvalue to initialize
 /// \param capturedByInit true if \p D is a __block variable
 ///   whose address is potentially changed by the initializer
 void CodeGenFunction::EmitExprAsInit(const Expr *init, const ValueDecl *D,

@@ -9,6 +9,8 @@
 #ifndef MLIR_PASS_PASSMANAGER_H
 #define MLIR_PASS_PASSMANAGER_H
 
+#include "mlir/IR/Dialect.h"
+#include "mlir/IR/OperationSupport.h"
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/Optional.h"
 #include "llvm/ADT/SmallVector.h"
@@ -57,6 +59,14 @@ public:
   pass_iterator end();
   iterator_range<pass_iterator> getPasses() { return {begin(), end()}; }
 
+  using const_pass_iterator = llvm::pointee_iterator<
+      std::vector<std::unique_ptr<Pass>>::const_iterator>;
+  const_pass_iterator begin() const;
+  const_pass_iterator end() const;
+  iterator_range<const_pass_iterator> getPasses() const {
+    return {begin(), end()};
+  }
+
   /// Run the held passes over the given operation.
   LogicalResult run(Operation *op, AnalysisManager am);
 
@@ -98,6 +108,11 @@ public:
 
   /// Merge the pass statistics of this class into 'other'.
   void mergeStatisticsInto(OpPassManager &other);
+
+  /// Register dependent dialects for the current pass manager.
+  /// This is forwarding to every pass in this PassManager, see the
+  /// documentation for the same method on the Pass class.
+  void getDependentDialects(DialectRegistry &dialects) const;
 
 private:
   OpPassManager(OperationName name, bool verifyPasses);
@@ -172,8 +187,11 @@ public:
     ///   pass, in the case of a non-failure, we should first check if any
     ///   potential mutations were made. This allows for reducing the number of
     ///   logs that don't contain meaningful changes.
-    explicit IRPrinterConfig(bool printModuleScope = false,
-                             bool printAfterOnlyOnChange = false);
+    /// * 'opPrintingFlags' sets up the printing flags to use when printing the
+    ///   IR.
+    explicit IRPrinterConfig(
+        bool printModuleScope = false, bool printAfterOnlyOnChange = false,
+        OpPrintingFlags opPrintingFlags = OpPrintingFlags());
     virtual ~IRPrinterConfig();
 
     /// A hook that may be overridden by a derived config that checks if the IR
@@ -197,6 +215,9 @@ public:
     /// "changed".
     bool shouldPrintAfterOnlyOnChange() const { return printAfterOnlyOnChange; }
 
+    /// Returns the printing flags to be used to print the IR.
+    OpPrintingFlags getOpPrintingFlags() const { return opPrintingFlags; }
+
   private:
     /// A flag that indicates if the IR should be printed at module scope.
     bool printModuleScope;
@@ -204,6 +225,9 @@ public:
     /// A flag that indicates that the IR after a pass should only be printed if
     /// a change is detected.
     bool printAfterOnlyOnChange;
+
+    /// Flags to control printing behavior.
+    OpPrintingFlags opPrintingFlags;
   };
 
   /// Add an instrumentation to print the IR before and after pass execution,
@@ -220,6 +244,8 @@ public:
   /// * 'printAfterOnlyOnChange' signals that when printing the IR after a
   ///   pass, in the case of a non-failure, we should first check if any
   ///   potential mutations were made.
+  /// * 'opPrintingFlags' sets up the printing flags to use when printing the
+  ///   IR.
   /// * 'out' corresponds to the stream to output the printed IR to.
   void enableIRPrinting(
       std::function<bool(Pass *, Operation *)> shouldPrintBeforePass =
@@ -227,7 +253,8 @@ public:
       std::function<bool(Pass *, Operation *)> shouldPrintAfterPass =
           [](Pass *, Operation *) { return true; },
       bool printModuleScope = true, bool printAfterOnlyOnChange = true,
-      raw_ostream &out = llvm::errs());
+      raw_ostream &out = llvm::errs(),
+      OpPrintingFlags opPrintingFlags = OpPrintingFlags());
 
   //===--------------------------------------------------------------------===//
   // Pass Timing

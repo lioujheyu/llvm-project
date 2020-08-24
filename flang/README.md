@@ -8,30 +8,30 @@ F18 was subsequently accepted into the LLVM project and rechristened as Flang.
 
 ## Getting Started
 
-Read more about flang in the [documentation directory](documentation).
-Start with the [compiler overview](documentation/Overview.md).
+Read more about flang in the [docs directory](docs).
+Start with the [compiler overview](docs/Overview.md).
 
 To better understand Fortran as a language
 and the specific grammar accepted by flang,
-read [Fortran For C Programmers](documentation/FortranForCProgrammers.md)
+read [Fortran For C Programmers](docs/FortranForCProgrammers.md)
 and
-flang's specifications of the [Fortran grammar](documentation/f2018-grammar.txt)
+flang's specifications of the [Fortran grammar](docs/f2018-grammar.txt)
 and
-the [OpenMP grammar](documentation/OpenMP-4.5-grammar.txt).
+the [OpenMP grammar](docs/OpenMP-4.5-grammar.txt).
 
 Treatment of language extensions is covered
-in [this document](documentation/Extensions.md).
+in [this document](docs/Extensions.md).
 
 To understand the compilers handling of intrinsics,
-see the [discussion of intrinsics](documentation/Intrinsics.md).
+see the [discussion of intrinsics](docs/Intrinsics.md).
 
 To understand how a flang program communicates with libraries at runtime,
-see the discussion of [runtime descriptors](documentation/RuntimeDescriptor.md).
+see the discussion of [runtime descriptors](docs/RuntimeDescriptor.md).
 
 If you're interested in contributing to the compiler,
-read the [style guide](documentation/C++style.md)
+read the [style guide](docs/C++style.md)
 and
-also review [how flang uses modern C++ features](documentation/C++17.md).
+also review [how flang uses modern C++ features](docs/C++17.md).
 
 ## Supported C++ compilers
 
@@ -140,8 +140,13 @@ cd ~/flang/build
 cmake -DLLVM_DIR=$LLVM -DMLIR_DIR=$MLIR ~/flang/src
 make
 ```
-### How to Run the Regression Tests
+# How to Run Tests
 
+Flang supports 2 different categories of tests
+1. Regression tests (https://www.llvm.org/docs/TestingGuide.html#regression-tests)
+2. Unit tests (https://www.llvm.org/docs/TestingGuide.html#unit-tests)
+
+## For out of tree builds
 To run all tests:
 ```
 cd ~/flang/build
@@ -157,6 +162,38 @@ flang_site_config and flang_config. And they can be set as shown bellow:
  --param flang_site_config=<path-to-flang-build>/test-lit/lit.site.cfg.py \
  --param flang_config=<path-to-flang-build>/test-lit/lit.cfg.py \
   <path-to-fortran-test>
+
+```
+
+Unit tests:
+
+If flang was built with `-DFLANG_INCLUDE_TESTS=On` (`ON` by default), it is possible to generate unittests.
+Note: Unit-tests will be skipped for LLVM install for an out-of-tree build as it does not include googletest related headers and libraries.
+
+There are various ways to run unit-tests.
+
+```
+
+1. make check-flang-unit
+2. make check-all or make check-flang
+3. <path-to-llvm-lit>/llvm-lit \
+        test/Unit
+4. Invoking tests from <out-of-tree flang build>/unittests/<respective unit test folder>
+
+```
+
+
+## For in tree builds
+If flang was built with `-DFLANG_INCLUDE_TESTS=On` (`On` by default), it is possible to
+generate unittests.
+
+To run all of the flang unit tests use the `check-flang-unit` target:
+```
+make check-flang-unit
+```
+To run all of the flang regression tests use the `check-flang` target:
+```
+make check-flang
 ```
 
 # How to Generate Documentation
@@ -179,4 +216,3 @@ It will generate html in
 
     <build-dir>/tools/flang/docs/doxygen/html # for flang docs
 ```
-

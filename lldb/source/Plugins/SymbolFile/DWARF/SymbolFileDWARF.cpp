@@ -162,16 +162,44 @@ ParseLLVMLineTable(lldb_private::DWARFContext &context,
   llvm::Expected<const llvm::DWARFDebugLine::LineTable *> line_table =
       line.getOrParseLineTable(
           data, line_offset, ctx, nullptr, [&](llvm::Error e) {
-            LLDB_LOG_ERROR(log, std::move(e),
-                           "SymbolFileDWARF::ParseLineTable failed to parse");
+            LLDB_LOG_ERROR(
+                log, std::move(e),
+                "SymbolFileDWARF::ParseLineTable failed to parse: {0}");
           });
 
   if (!line_table) {
     LLDB_LOG_ERROR(log, line_table.takeError(),
-                   "SymbolFileDWARF::ParseLineTable failed to parse");
+                   "SymbolFileDWARF::ParseLineTable failed to parse: {0}");
     return nullptr;
   }
   return *line_table;
+}
+
+static bool ParseLLVMLineTablePrologue(lldb_private::DWARFContext &context,
+                                       llvm::DWARFDebugLine::Prologue &prologue,
+                                       dw_offset_t line_offset,
+                                       dw_offset_t unit_offset) {
+  Log *log = LogChannelDWARF::GetLogIfAll(DWARF_LOG_DEBUG_INFO);
+  bool success = true;
+  llvm::DWARFDataExtractor data = context.getOrLoadLineData().GetAsLLVM();
+  llvm::DWARFContext &ctx = context.GetAsLLVM();
+  uint64_t offset = line_offset;
+  llvm::Error error = prologue.parse(
+      data, &offset,
+      [&](llvm::Error e) {
+        success = false;
+        LLDB_LOG_ERROR(log, std::move(e),
+                       "SymbolFileDWARF::ParseSupportFiles failed to parse "
+                       "line table prologue: {0}");
+      },
+      ctx, nullptr);
+  if (error) {
+    LLDB_LOG_ERROR(log, std::move(error),
+                   "SymbolFileDWARF::ParseSupportFiles failed to parse line "
+                   "table prologue: {0}");
+    return false;
+  }
+  return success;
 }
 
 static llvm::Optional<std::string>
@@ -623,7 +651,7 @@ DWARFDebugRanges *SymbolFileDWARF::GetDebugRanges() {
                        static_cast<void *>(this));
 
     if (m_context.getOrLoadRangesData().GetByteSize() > 0)
-      m_ranges.reset(new DWARFDebugRanges());
+      m_ranges = std::make_unique<DWARFDebugRanges>();
 
     if (m_ranges)
       m_ranges->Extract(m_context);
@@ -854,8 +882,24 @@ bool SymbolFileDWARF::ForEachExternalModule(
 
 bool SymbolFileDWARF::ParseSupportFiles(CompileUnit &comp_unit,
                                         FileSpecList &support_files) {
-  if (!comp_unit.GetLineTable())
-    ParseLineTable(comp_unit);
+  std::lock_guard<std::recursive_mutex> guard(GetModuleMutex());
+  DWARFUnit *dwarf_cu = GetDWARFCompileUnit(&comp_unit);
+  if (!dwarf_cu)
+    return false;
+
+  dw_offset_t offset = dwarf_cu->GetLineTableOffset();
+  if (offset == DW_INVALID_OFFSET)
+    return false;
+
+  llvm::DWARFDebugLine::Prologue prologue;
+  if (!ParseLLVMLineTablePrologue(m_context, prologue, offset,
+                                  dwarf_cu->GetOffset()))
+    return false;
+
+  comp_unit.SetSupportFiles(ParseSupportFilesFromPrologue(
+      comp_unit.GetModule(), prologue, dwarf_cu->GetPathStyle(),
+      dwarf_cu->GetCompilationDirectory().GetCString()));
+
   return true;
 }
 
@@ -978,18 +1022,13 @@ bool SymbolFileDWARF::ParseLineTable(CompileUnit &comp_unit) {
   if (!dwarf_cu)
     return false;
 
-  const DWARFBaseDIE dwarf_cu_die = dwarf_cu->GetUnitDIEOnly();
-  if (!dwarf_cu_die)
-    return false;
-
-  const dw_offset_t cu_line_offset = dwarf_cu_die.GetAttributeValueAsUnsigned(
-      DW_AT_stmt_list, DW_INVALID_OFFSET);
-  if (cu_line_offset == DW_INVALID_OFFSET)
+  dw_offset_t offset = dwarf_cu->GetLineTableOffset();
+  if (offset == DW_INVALID_OFFSET)
     return false;
 
   llvm::DWARFDebugLine line;
-  const llvm::DWARFDebugLine::LineTable *line_table = ParseLLVMLineTable(
-      m_context, line, cu_line_offset, dwarf_cu->GetOffset());
+  const llvm::DWARFDebugLine::LineTable *line_table =
+      ParseLLVMLineTable(m_context, line, offset, dwarf_cu->GetOffset());
 
   if (!line_table)
     return false;
@@ -997,18 +1036,20 @@ bool SymbolFileDWARF::ParseLineTable(CompileUnit &comp_unit) {
   // FIXME: Rather than parsing the whole line table and then copying it over
   // into LLDB, we should explore using a callback to populate the line table
   // while we parse to reduce memory usage.
-  std::unique_ptr<LineSequence> sequence =
-      LineTable::CreateLineSequenceContainer();
   std::vector<std::unique_ptr<LineSequence>> sequences;
-  for (auto &row : line_table->Rows) {
-    LineTable::AppendLineEntryToSequence(
-        sequence.get(), row.Address.Address, row.Line, row.Column, row.File,
-        row.IsStmt, row.BasicBlock, row.PrologueEnd, row.EpilogueBegin,
-        row.EndSequence);
-    if (row.EndSequence) {
-      sequences.push_back(std::move(sequence));
-      sequence = LineTable::CreateLineSequenceContainer();
+  // The Sequences view contains only valid line sequences. Don't iterate over
+  // the Rows directly.
+  for (const llvm::DWARFDebugLine::Sequence &seq : line_table->Sequences) {
+    std::unique_ptr<LineSequence> sequence =
+        LineTable::CreateLineSequenceContainer();
+    for (unsigned idx = seq.FirstRowIndex; idx < seq.LastRowIndex; ++idx) {
+      const llvm::DWARFDebugLine::Row &row = line_table->Rows[idx];
+      LineTable::AppendLineEntryToSequence(
+          sequence.get(), row.Address.Address, row.Line, row.Column, row.File,
+          row.IsStmt, row.BasicBlock, row.PrologueEnd, row.EpilogueBegin,
+          row.EndSequence);
     }
+    sequences.push_back(std::move(sequence));
   }
 
   std::unique_ptr<LineTable> line_table_up =
@@ -1023,10 +1064,6 @@ bool SymbolFileDWARF::ParseLineTable(CompileUnit &comp_unit) {
   } else {
     comp_unit.SetLineTable(line_table_up.release());
   }
-
-  comp_unit.SetSupportFiles(ParseSupportFilesFromPrologue(
-      comp_unit.GetModule(), line_table->Prologue, dwarf_cu->GetPathStyle(),
-      dwarf_cu->GetCompilationDirectory().GetCString()));
 
   return true;
 }
@@ -1157,15 +1194,15 @@ size_t SymbolFileDWARF::ParseBlocksRecursive(
             (name != nullptr || mangled_name != nullptr)) {
           std::unique_ptr<Declaration> decl_up;
           if (decl_file != 0 || decl_line != 0 || decl_column != 0)
-            decl_up.reset(new Declaration(
+            decl_up = std::make_unique<Declaration>(
                 comp_unit.GetSupportFiles().GetFileSpecAtIndex(decl_file),
-                decl_line, decl_column));
+                decl_line, decl_column);
 
           std::unique_ptr<Declaration> call_up;
           if (call_file != 0 || call_line != 0 || call_column != 0)
-            call_up.reset(new Declaration(
+            call_up = std::make_unique<Declaration>(
                 comp_unit.GetSupportFiles().GetFileSpecAtIndex(call_file),
-                call_line, call_column));
+                call_line, call_column);
 
           block->SetInlinedFunctionInfo(name, mangled_name, decl_up.get(),
                                         call_up.get());
@@ -1728,7 +1765,7 @@ void SymbolFileDWARF::UpdateExternalModuleListIfNeeded() {
 
 SymbolFileDWARF::GlobalVariableMap &SymbolFileDWARF::GetGlobalAranges() {
   if (!m_global_aranges_up) {
-    m_global_aranges_up.reset(new GlobalVariableMap());
+    m_global_aranges_up = std::make_unique<GlobalVariableMap>();
 
     ModuleSP module_sp = GetObjectFile()->GetModule();
     if (module_sp) {
@@ -1754,7 +1791,7 @@ SymbolFileDWARF::GlobalVariableMap &SymbolFileDWARF::GetGlobalAranges() {
                     lldb::addr_t byte_size = 1;
                     if (var_sp->GetType())
                       byte_size =
-                          var_sp->GetType()->GetByteSize().getValueOr(0);
+                          var_sp->GetType()->GetByteSize(nullptr).getValueOr(0);
                     m_global_aranges_up->Append(GlobalVariableMap::Entry(
                         file_addr, byte_size, var_sp.get()));
                   }
@@ -2387,7 +2424,7 @@ void SymbolFileDWARF::FindTypes(
     UpdateExternalModuleListIfNeeded();
 
     for (const auto &pair : m_external_type_modules)
-      if (ModuleSP external_module_sp = pair.second) 
+      if (ModuleSP external_module_sp = pair.second)
         if (SymbolFile *sym_file = external_module_sp->GetSymbolFile())
           sym_file->FindTypes(name, parent_decl_ctx, max_matches,
                               searched_symbol_files, types);
@@ -3408,9 +3445,10 @@ VariableSP SymbolFileDWARF::ParseVariableDIE(const SymbolContext &sc,
             new SymbolFileType(*this, GetUID(type_die_form.Reference())));
 
         if (const_value.Form() && type_sp && type_sp->GetType())
-          location.UpdateValue(const_value.Unsigned(),
-                               type_sp->GetType()->GetByteSize().getValueOr(0),
-                               die.GetCU()->GetAddressByteSize());
+          location.UpdateValue(
+              const_value.Unsigned(),
+              type_sp->GetType()->GetByteSize(nullptr).getValueOr(0),
+              die.GetCU()->GetAddressByteSize());
 
         var_sp = std::make_shared<Variable>(
             die.GetID(), name, mangled, type_sp, scope, symbol_context_scope,
@@ -3809,6 +3847,11 @@ SymbolFileDWARF::CollectCallEdges(ModuleSP module, DWARFDIE function_die) {
 
 std::vector<std::unique_ptr<lldb_private::CallEdge>>
 SymbolFileDWARF::ParseCallEdgesInFunction(UserID func_id) {
+  // ParseCallEdgesInFunction must be called at the behest of an exclusively
+  // locked lldb::Function instance. Storage for parsed call edges is owned by
+  // the lldb::Function instance: locking at the SymbolFile level would be too
+  // late, because the act of storing results from ParseCallEdgesInFunction
+  // would be racy.
   DWARFDIE func_die = GetDIE(func_id.GetID());
   if (func_die.IsValid())
     return CollectCallEdges(GetObjectFile()->GetModule(), func_die);

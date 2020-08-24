@@ -86,6 +86,7 @@ CGOPT(bool, EnableAddrsig)
 CGOPT(bool, EmitCallSiteInfo)
 CGOPT(bool, EnableDebugEntryValues)
 CGOPT(bool, ForceDwarfFrameSection)
+CGOPT(bool, XRayOmitFunctionIndex)
 
 codegen::RegisterCodeGenFlags::RegisterCodeGenFlags() {
 #define CGBINDOPT(NAME)                                                        \
@@ -331,7 +332,7 @@ codegen::RegisterCodeGenFlags::RegisterCodeGenFlags() {
   CGBINDOPT(FunctionSections);
 
   static cl::opt<std::string> BBSections(
-      "basicblock-sections",
+      "basic-block-sections",
       cl::desc("Emit basic blocks into separate sections"),
       cl::value_desc("all | <function list (file)> | labels | none"),
       cl::init("none"));
@@ -351,7 +352,7 @@ codegen::RegisterCodeGenFlags::RegisterCodeGenFlags() {
   CGBINDOPT(UniqueSectionNames);
 
   static cl::opt<bool> UniqueBasicBlockSectionNames(
-      "unique-bb-section-names",
+      "unique-basic-block-section-names",
       cl::desc("Give unique names to every basic block section"),
       cl::init(false));
   CGBINDOPT(UniqueBasicBlockSectionNames);
@@ -403,6 +404,11 @@ codegen::RegisterCodeGenFlags::RegisterCodeGenFlags() {
       "force-dwarf-frame-section",
       cl::desc("Always emit a debug frame section."), cl::init(false));
   CGBINDOPT(ForceDwarfFrameSection);
+
+  static cl::opt<bool> XRayOmitFunctionIndex(
+      "no-xray-index", cl::desc("Don't emit xray_fn_idx section"),
+      cl::init(false));
+  CGBINDOPT(XRayOmitFunctionIndex);
 
 #undef CGBINDOPT
 
@@ -470,6 +476,7 @@ TargetOptions codegen::InitTargetOptionsFromCodeGenFlags() {
   Options.EmitCallSiteInfo = getEmitCallSiteInfo();
   Options.EnableDebugEntryValues = getEnableDebugEntryValues();
   Options.ForceDwarfFrameSection = getForceDwarfFrameSection();
+  Options.XRayOmitFunctionIndex = getXRayOmitFunctionIndex();
 
   Options.MCOptions = mc::InitMCTargetOptionsFromFlags();
 

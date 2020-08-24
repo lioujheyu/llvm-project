@@ -15,6 +15,7 @@
 
 #include "llvm/Support/FileCheck.h"
 #include "FileCheckImpl.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/CheckedArithmetic.h"
@@ -230,6 +231,86 @@ Expected<ExpressionValue> llvm::operator-(const ExpressionValue &LeftOperand,
   }
 }
 
+Expected<ExpressionValue> llvm::operator*(const ExpressionValue &LeftOperand,
+                                          const ExpressionValue &RightOperand) {
+  // -A * -B == A * B
+  if (LeftOperand.isNegative() && RightOperand.isNegative())
+    return LeftOperand.getAbsolute() * RightOperand.getAbsolute();
+
+  // A * -B == -B * A
+  if (RightOperand.isNegative())
+    return RightOperand * LeftOperand;
+
+  assert(!RightOperand.isNegative() && "Unexpected negative operand!");
+
+  // Result will be negative and can underflow.
+  if (LeftOperand.isNegative()) {
+    auto Result = LeftOperand.getAbsolute() * RightOperand.getAbsolute();
+    if (!Result)
+      return Result;
+
+    return ExpressionValue(0) - *Result;
+  }
+
+  // Result will be positive and can overflow.
+  uint64_t LeftValue = cantFail(LeftOperand.getUnsignedValue());
+  uint64_t RightValue = cantFail(RightOperand.getUnsignedValue());
+  Optional<uint64_t> Result =
+      checkedMulUnsigned<uint64_t>(LeftValue, RightValue);
+  if (!Result)
+    return make_error<OverflowError>();
+
+  return ExpressionValue(*Result);
+}
+
+Expected<ExpressionValue> llvm::operator/(const ExpressionValue &LeftOperand,
+                                          const ExpressionValue &RightOperand) {
+  // -A / -B == A / B
+  if (LeftOperand.isNegative() && RightOperand.isNegative())
+    return LeftOperand.getAbsolute() / RightOperand.getAbsolute();
+
+  // Check for divide by zero.
+  if (RightOperand == ExpressionValue(0))
+    return make_error<OverflowError>();
+
+  // Result will be negative and can underflow.
+  if (LeftOperand.isNegative() || RightOperand.isNegative())
+    return ExpressionValue(0) -
+           cantFail(LeftOperand.getAbsolute() / RightOperand.getAbsolute());
+
+  uint64_t LeftValue = cantFail(LeftOperand.getUnsignedValue());
+  uint64_t RightValue = cantFail(RightOperand.getUnsignedValue());
+  return ExpressionValue(LeftValue / RightValue);
+}
+
+Expected<ExpressionValue> llvm::max(const ExpressionValue &LeftOperand,
+                                    const ExpressionValue &RightOperand) {
+  if (LeftOperand.isNegative() && RightOperand.isNegative()) {
+    int64_t LeftValue = cantFail(LeftOperand.getSignedValue());
+    int64_t RightValue = cantFail(RightOperand.getSignedValue());
+    return ExpressionValue(std::max(LeftValue, RightValue));
+  }
+
+  if (!LeftOperand.isNegative() && !RightOperand.isNegative()) {
+    uint64_t LeftValue = cantFail(LeftOperand.getUnsignedValue());
+    uint64_t RightValue = cantFail(RightOperand.getUnsignedValue());
+    return ExpressionValue(std::max(LeftValue, RightValue));
+  }
+
+  if (LeftOperand.isNegative())
+    return RightOperand;
+
+  return LeftOperand;
+}
+
+Expected<ExpressionValue> llvm::min(const ExpressionValue &LeftOperand,
+                                    const ExpressionValue &RightOperand) {
+  if (cantFail(max(LeftOperand, RightOperand)) == LeftOperand)
+    return RightOperand;
+
+  return LeftOperand;
+}
+
 Expected<ExpressionValue> NumericVariableUse::eval() const {
   Optional<ExpressionValue> Value = Variable->getValue();
   if (Value)
@@ -309,23 +390,20 @@ Pattern::parseVariable(StringRef &Str, const SourceMgr &SM) {
   if (Str.empty())
     return ErrorDiagnostic::get(SM, Str, "empty variable name");
 
-  bool ParsedOneChar = false;
-  unsigned I = 0;
+  size_t I = 0;
   bool IsPseudo = Str[0] == '@';
 
   // Global vars start with '$'.
   if (Str[0] == '$' || IsPseudo)
     ++I;
 
-  for (unsigned E = Str.size(); I != E; ++I) {
-    if (!ParsedOneChar && !isValidVarNameStart(Str[I]))
-      return ErrorDiagnostic::get(SM, Str, "invalid variable name");
+  if (!isValidVarNameStart(Str[I++]))
+    return ErrorDiagnostic::get(SM, Str, "invalid variable name");
 
+  for (size_t E = Str.size(); I != E; ++I)
     // Variable names are composed of alphanumeric characters and underscores.
     if (Str[I] != '_' && !isAlnum(Str[I]))
       break;
-    ParsedOneChar = true;
-  }
 
   StringRef Name = Str.take_front(I);
   Str = Str.substr(I);
@@ -423,8 +501,9 @@ Expected<std::unique_ptr<NumericVariableUse>> Pattern::parseNumericVariableUse(
 }
 
 Expected<std::unique_ptr<ExpressionAST>> Pattern::parseNumericOperand(
-    StringRef &Expr, AllowedOperand AO, Optional<size_t> LineNumber,
-    FileCheckPatternContext *Context, const SourceMgr &SM) {
+    StringRef &Expr, AllowedOperand AO, bool MaybeInvalidConstraint,
+    Optional<size_t> LineNumber, FileCheckPatternContext *Context,
+    const SourceMgr &SM) {
   if (Expr.startswith("(")) {
     if (AO != AllowedOperand::Any)
       return ErrorDiagnostic::get(
@@ -436,10 +515,22 @@ Expected<std::unique_ptr<ExpressionAST>> Pattern::parseNumericOperand(
     // Try to parse as a numeric variable use.
     Expected<Pattern::VariableProperties> ParseVarResult =
         parseVariable(Expr, SM);
-    if (ParseVarResult)
+    if (ParseVarResult) {
+      // Try to parse a function call.
+      if (Expr.ltrim(SpaceChars).startswith("(")) {
+        if (AO != AllowedOperand::Any)
+          return ErrorDiagnostic::get(SM, ParseVarResult->Name,
+                                      "unexpected function call");
+
+        return parseCallExpr(Expr, ParseVarResult->Name, LineNumber, Context,
+                             SM);
+      }
+
       return parseNumericVariableUse(ParseVarResult->Name,
                                      ParseVarResult->IsPseudo, LineNumber,
                                      Context, SM);
+    }
+
     if (AO == AllowedOperand::LineVar)
       return ParseVarResult.takeError();
     // Ignore the error and retry parsing as a literal.
@@ -460,8 +551,11 @@ Expected<std::unique_ptr<ExpressionAST>> Pattern::parseNumericOperand(
     return std::make_unique<ExpressionLiteral>(SaveExpr.drop_back(Expr.size()),
                                                SignedLiteralValue);
 
-  return ErrorDiagnostic::get(SM, Expr,
-                              "invalid operand format '" + Expr + "'");
+  return ErrorDiagnostic::get(
+      SM, Expr,
+      Twine("invalid ") +
+          (MaybeInvalidConstraint ? "matching constraint or " : "") +
+          "operand format");
 }
 
 Expected<std::unique_ptr<ExpressionAST>>
@@ -477,8 +571,9 @@ Pattern::parseParenExpr(StringRef &Expr, Optional<size_t> LineNumber,
     return ErrorDiagnostic::get(SM, Expr, "missing operand in expression");
 
   // Note: parseNumericOperand handles nested opening parentheses.
-  Expected<std::unique_ptr<ExpressionAST>> SubExprResult =
-      parseNumericOperand(Expr, AllowedOperand::Any, LineNumber, Context, SM);
+  Expected<std::unique_ptr<ExpressionAST>> SubExprResult = parseNumericOperand(
+      Expr, AllowedOperand::Any, /*MaybeInvalidConstraint=*/false, LineNumber,
+      Context, SM);
   Expr = Expr.ltrim(SpaceChars);
   while (SubExprResult && !Expr.empty() && !Expr.startswith(")")) {
     StringRef OrigExpr = Expr;
@@ -531,13 +626,90 @@ Pattern::parseBinop(StringRef Expr, StringRef &RemainingExpr,
   AllowedOperand AO =
       IsLegacyLineExpr ? AllowedOperand::LegacyLiteral : AllowedOperand::Any;
   Expected<std::unique_ptr<ExpressionAST>> RightOpResult =
-      parseNumericOperand(RemainingExpr, AO, LineNumber, Context, SM);
+      parseNumericOperand(RemainingExpr, AO, /*MaybeInvalidConstraint=*/false,
+                          LineNumber, Context, SM);
   if (!RightOpResult)
     return RightOpResult;
 
   Expr = Expr.drop_back(RemainingExpr.size());
   return std::make_unique<BinaryOperation>(Expr, EvalBinop, std::move(LeftOp),
                                            std::move(*RightOpResult));
+}
+
+Expected<std::unique_ptr<ExpressionAST>>
+Pattern::parseCallExpr(StringRef &Expr, StringRef FuncName,
+                       Optional<size_t> LineNumber,
+                       FileCheckPatternContext *Context, const SourceMgr &SM) {
+  Expr = Expr.ltrim(SpaceChars);
+  assert(Expr.startswith("("));
+
+  auto OptFunc = StringSwitch<Optional<binop_eval_t>>(FuncName)
+                     .Case("add", operator+)
+                     .Case("div", operator/)
+                     .Case("max", max)
+                     .Case("min", min)
+                     .Case("mul", operator*)
+                     .Case("sub", operator-)
+                     .Default(None);
+
+  if (!OptFunc)
+    return ErrorDiagnostic::get(
+        SM, FuncName, Twine("call to undefined function '") + FuncName + "'");
+
+  Expr.consume_front("(");
+  Expr = Expr.ltrim(SpaceChars);
+
+  // Parse call arguments, which are comma separated.
+  SmallVector<std::unique_ptr<ExpressionAST>, 4> Args;
+  while (!Expr.empty() && !Expr.startswith(")")) {
+    if (Expr.startswith(","))
+      return ErrorDiagnostic::get(SM, Expr, "missing argument");
+
+    // Parse the argument, which is an arbitary expression.
+    StringRef OuterBinOpExpr = Expr;
+    Expected<std::unique_ptr<ExpressionAST>> Arg = parseNumericOperand(
+        Expr, AllowedOperand::Any, /*MaybeInvalidConstraint=*/false, LineNumber,
+        Context, SM);
+    while (Arg && !Expr.empty()) {
+      Expr = Expr.ltrim(SpaceChars);
+      // Have we reached an argument terminator?
+      if (Expr.startswith(",") || Expr.startswith(")"))
+        break;
+
+      // Arg = Arg <op> <expr>
+      Arg = parseBinop(OuterBinOpExpr, Expr, std::move(*Arg), false, LineNumber,
+                       Context, SM);
+    }
+
+    // Prefer an expression error over a generic invalid argument message.
+    if (!Arg)
+      return Arg.takeError();
+    Args.push_back(std::move(*Arg));
+
+    // Have we parsed all available arguments?
+    Expr = Expr.ltrim(SpaceChars);
+    if (!Expr.consume_front(","))
+      break;
+
+    Expr = Expr.ltrim(SpaceChars);
+    if (Expr.startswith(")"))
+      return ErrorDiagnostic::get(SM, Expr, "missing argument");
+  }
+
+  if (!Expr.consume_front(")"))
+    return ErrorDiagnostic::get(SM, Expr,
+                                "missing ')' at end of call expression");
+
+  const unsigned NumArgs = Args.size();
+  if (NumArgs == 2)
+    return std::make_unique<BinaryOperation>(Expr, *OptFunc, std::move(Args[0]),
+                                             std::move(Args[1]));
+
+  // TODO: Support more than binop_eval_t.
+  return ErrorDiagnostic::get(SM, FuncName,
+                              Twine("function '") + FuncName +
+                                  Twine("' takes 2 arguments but ") +
+                                  Twine(NumArgs) + " given");
 }
 
 Expected<std::unique_ptr<Expression>> Pattern::parseNumericSubstitutionBlock(
@@ -549,9 +721,10 @@ Expected<std::unique_ptr<Expression>> Pattern::parseNumericSubstitutionBlock(
   DefinedNumericVariable = None;
   ExpressionFormat ExplicitFormat = ExpressionFormat();
 
-  // Parse format specifier.
+  // Parse format specifier (NOTE: ',' is also an argument seperator).
   size_t FormatSpecEnd = Expr.find(',');
-  if (FormatSpecEnd != StringRef::npos) {
+  size_t FunctionStart = Expr.find('(');
+  if (FormatSpecEnd != StringRef::npos && FormatSpecEnd < FunctionStart) {
     Expr = Expr.ltrim(SpaceChars);
     if (!Expr.consume_front("%"))
       return ErrorDiagnostic::get(
@@ -591,17 +764,27 @@ Expected<std::unique_ptr<Expression>> Pattern::parseNumericSubstitutionBlock(
     Expr = Expr.substr(DefEnd + 1);
   }
 
+  // Parse matching constraint.
+  Expr = Expr.ltrim(SpaceChars);
+  bool HasParsedValidConstraint = false;
+  if (Expr.consume_front("=="))
+    HasParsedValidConstraint = true;
+
   // Parse the expression itself.
   Expr = Expr.ltrim(SpaceChars);
-  if (!Expr.empty()) {
+  if (Expr.empty()) {
+    if (HasParsedValidConstraint)
+      return ErrorDiagnostic::get(
+          SM, Expr, "empty numeric expression should not have a constraint");
+  } else {
     Expr = Expr.rtrim(SpaceChars);
     StringRef OuterBinOpExpr = Expr;
     // The first operand in a legacy @LINE expression is always the @LINE
     // pseudo variable.
     AllowedOperand AO =
         IsLegacyLineExpr ? AllowedOperand::LineVar : AllowedOperand::Any;
-    Expected<std::unique_ptr<ExpressionAST>> ParseResult =
-        parseNumericOperand(Expr, AO, LineNumber, Context, SM);
+    Expected<std::unique_ptr<ExpressionAST>> ParseResult = parseNumericOperand(
+        Expr, AO, !HasParsedValidConstraint, LineNumber, Context, SM);
     while (ParseResult && !Expr.empty()) {
       ParseResult = parseBinop(OuterBinOpExpr, Expr, std::move(*ParseResult),
                                IsLegacyLineExpr, LineNumber, Context, SM);
@@ -1036,7 +1219,7 @@ Expected<size_t> Pattern::match(StringRef Buffer, size_t &MatchLen,
         Format.valueFromStringRepr(MatchedValue, SM);
     if (!Value)
       return Value.takeError();
-    DefinedNumericVariable->setValue(*Value);
+    DefinedNumericVariable->setValue(*Value, MatchedValue);
   }
 
   // Like CHECK-NEXT, CHECK-EMPTY's match range is considered to start after
@@ -1065,7 +1248,9 @@ unsigned Pattern::computeMatchDistance(StringRef Buffer) const {
 }
 
 void Pattern::printSubstitutions(const SourceMgr &SM, StringRef Buffer,
-                                 SMRange MatchRange) const {
+                                 SMRange Range,
+                                 FileCheckDiag::MatchType MatchTy,
+                                 std::vector<FileCheckDiag> *Diags) const {
   // Print what we know about substitutions.
   if (!Substitutions.empty()) {
     for (const auto &Substitution : Substitutions) {
@@ -1098,13 +1283,67 @@ void Pattern::printSubstitutions(const SourceMgr &SM, StringRef Buffer,
         OS.write_escaped(*MatchedValue) << "\"";
       }
 
-      if (MatchRange.isValid())
-        SM.PrintMessage(MatchRange.Start, SourceMgr::DK_Note, OS.str(),
-                        {MatchRange});
+      // We report only the start of the match/search range to suggest we are
+      // reporting the substitutions as set at the start of the match/search.
+      // Indicating a non-zero-length range might instead seem to imply that the
+      // substitution matches or was captured from exactly that range.
+      if (Diags)
+        Diags->emplace_back(SM, CheckTy, getLoc(), MatchTy,
+                            SMRange(Range.Start, Range.Start), OS.str());
       else
-        SM.PrintMessage(SMLoc::getFromPointer(Buffer.data()),
-                        SourceMgr::DK_Note, OS.str());
+        SM.PrintMessage(Range.Start, SourceMgr::DK_Note, OS.str());
     }
+  }
+}
+
+void Pattern::printVariableDefs(const SourceMgr &SM,
+                                FileCheckDiag::MatchType MatchTy,
+                                std::vector<FileCheckDiag> *Diags) const {
+  if (VariableDefs.empty() && NumericVariableDefs.empty())
+    return;
+  // Build list of variable captures.
+  struct VarCapture {
+    StringRef Name;
+    SMRange Range;
+  };
+  SmallVector<VarCapture, 2> VarCaptures;
+  for (const auto &VariableDef : VariableDefs) {
+    VarCapture VC;
+    VC.Name = VariableDef.first;
+    StringRef Value = Context->GlobalVariableTable[VC.Name];
+    SMLoc Start = SMLoc::getFromPointer(Value.data());
+    SMLoc End = SMLoc::getFromPointer(Value.data() + Value.size());
+    VC.Range = SMRange(Start, End);
+    VarCaptures.push_back(VC);
+  }
+  for (const auto &VariableDef : NumericVariableDefs) {
+    VarCapture VC;
+    VC.Name = VariableDef.getKey();
+    StringRef StrValue = VariableDef.getValue()
+                             .DefinedNumericVariable->getStringValue()
+                             .getValue();
+    SMLoc Start = SMLoc::getFromPointer(StrValue.data());
+    SMLoc End = SMLoc::getFromPointer(StrValue.data() + StrValue.size());
+    VC.Range = SMRange(Start, End);
+    VarCaptures.push_back(VC);
+  }
+  // Sort variable captures by the order in which they matched the input.
+  // Ranges shouldn't be overlapping, so we can just compare the start.
+  std::sort(VarCaptures.begin(), VarCaptures.end(),
+            [](const VarCapture &A, const VarCapture &B) {
+              assert(A.Range.Start != B.Range.Start &&
+                     "unexpected overlapping variable captures");
+              return A.Range.Start.getPointer() < B.Range.Start.getPointer();
+            });
+  // Create notes for the sorted captures.
+  for (const VarCapture &VC : VarCaptures) {
+    SmallString<256> Msg;
+    raw_svector_ostream OS(Msg);
+    OS << "captured var \"" << VC.Name << "\"";
+    if (Diags)
+      Diags->emplace_back(SM, CheckTy, getLoc(), MatchTy, VC.Range, OS.str());
+    else
+      SM.PrintMessage(VC.Range.Start, SourceMgr::DK_Note, OS.str(), VC.Range);
   }
 }
 
@@ -1113,14 +1352,17 @@ static SMRange ProcessMatchResult(FileCheckDiag::MatchType MatchTy,
                                   Check::FileCheckType CheckTy,
                                   StringRef Buffer, size_t Pos, size_t Len,
                                   std::vector<FileCheckDiag> *Diags,
-                                  bool AdjustPrevDiag = false) {
+                                  bool AdjustPrevDiags = false) {
   SMLoc Start = SMLoc::getFromPointer(Buffer.data() + Pos);
   SMLoc End = SMLoc::getFromPointer(Buffer.data() + Pos + Len);
   SMRange Range(Start, End);
   if (Diags) {
-    if (AdjustPrevDiag)
-      Diags->rbegin()->MatchTy = MatchTy;
-    else
+    if (AdjustPrevDiags) {
+      SMLoc CheckLoc = Diags->rbegin()->CheckLoc;
+      for (auto I = Diags->rbegin(), E = Diags->rend();
+           I != E && I->CheckLoc == CheckLoc; ++I)
+        I->MatchTy = MatchTy;
+    } else
       Diags->emplace_back(SM, CheckTy, Loc, MatchTy, Range);
   }
   return Range;
@@ -1273,8 +1515,8 @@ StringRef FileCheck::CanonicalizeFile(MemoryBuffer &MB,
 FileCheckDiag::FileCheckDiag(const SourceMgr &SM,
                              const Check::FileCheckType &CheckTy,
                              SMLoc CheckLoc, MatchType MatchTy,
-                             SMRange InputRange)
-    : CheckTy(CheckTy), CheckLoc(CheckLoc), MatchTy(MatchTy) {
+                             SMRange InputRange, StringRef Note)
+    : CheckTy(CheckTy), CheckLoc(CheckLoc), MatchTy(MatchTy), Note(Note) {
   auto Start = SM.getLineAndColumn(InputRange.Start);
   auto End = SM.getLineAndColumn(InputRange.End);
   InputStartLine = Start.first;
@@ -1337,9 +1579,7 @@ FindCheckType(const FileCheckRequest &Req, StringRef Buffer, StringRef Prefix) {
   StringRef Rest = Buffer.drop_front(Prefix.size() + 1);
 
   // Check for comment.
-  if (Req.CommentPrefixes.end() != std::find(Req.CommentPrefixes.begin(),
-                                             Req.CommentPrefixes.end(),
-                                             Prefix)) {
+  if (llvm::is_contained(Req.CommentPrefixes, Prefix)) {
     if (NextChar == ':')
       return {Check::CheckComment, Rest};
     // Ignore a comment prefix if it has a suffix like "-NOT".
@@ -1681,10 +1921,15 @@ static void PrintMatch(bool ExpectedMatch, const SourceMgr &SM,
     // diagnostics.
     PrintDiag = !Diags;
   }
-  SMRange MatchRange = ProcessMatchResult(
-      ExpectedMatch ? FileCheckDiag::MatchFoundAndExpected
-                    : FileCheckDiag::MatchFoundButExcluded,
-      SM, Loc, Pat.getCheckTy(), Buffer, MatchPos, MatchLen, Diags);
+  FileCheckDiag::MatchType MatchTy = ExpectedMatch
+                                         ? FileCheckDiag::MatchFoundAndExpected
+                                         : FileCheckDiag::MatchFoundButExcluded;
+  SMRange MatchRange = ProcessMatchResult(MatchTy, SM, Loc, Pat.getCheckTy(),
+                                          Buffer, MatchPos, MatchLen, Diags);
+  if (Diags) {
+    Pat.printSubstitutions(SM, Buffer, MatchRange, MatchTy, Diags);
+    Pat.printVariableDefs(SM, MatchTy, Diags);
+  }
   if (!PrintDiag)
     return;
 
@@ -1699,7 +1944,8 @@ static void PrintMatch(bool ExpectedMatch, const SourceMgr &SM,
       Loc, ExpectedMatch ? SourceMgr::DK_Remark : SourceMgr::DK_Error, Message);
   SM.PrintMessage(MatchRange.Start, SourceMgr::DK_Note, "found here",
                   {MatchRange});
-  Pat.printSubstitutions(SM, Buffer, MatchRange);
+  Pat.printSubstitutions(SM, Buffer, MatchRange, MatchTy, nullptr);
+  Pat.printVariableDefs(SM, MatchTy, nullptr);
 }
 
 static void PrintMatch(bool ExpectedMatch, const SourceMgr &SM,
@@ -1732,10 +1978,13 @@ static void PrintNoMatch(bool ExpectedMatch, const SourceMgr &SM,
   // If the current position is at the end of a line, advance to the start of
   // the next line.
   Buffer = Buffer.substr(Buffer.find_first_not_of(" \t\n\r"));
-  SMRange SearchRange = ProcessMatchResult(
-      ExpectedMatch ? FileCheckDiag::MatchNoneButExpected
-                    : FileCheckDiag::MatchNoneAndExcluded,
-      SM, Loc, Pat.getCheckTy(), Buffer, 0, Buffer.size(), Diags);
+  FileCheckDiag::MatchType MatchTy = ExpectedMatch
+                                         ? FileCheckDiag::MatchNoneButExpected
+                                         : FileCheckDiag::MatchNoneAndExcluded;
+  SMRange SearchRange = ProcessMatchResult(MatchTy, SM, Loc, Pat.getCheckTy(),
+                                           Buffer, 0, Buffer.size(), Diags);
+  if (Diags)
+    Pat.printSubstitutions(SM, Buffer, SearchRange, MatchTy, Diags);
   if (!PrintDiag) {
     consumeError(std::move(MatchErrors));
     return;
@@ -1763,7 +2012,7 @@ static void PrintNoMatch(bool ExpectedMatch, const SourceMgr &SM,
   SM.PrintMessage(SearchRange.Start, SourceMgr::DK_Note, "scanning from here");
 
   // Allow the pattern to print additional information if desired.
-  Pat.printSubstitutions(SM, Buffer);
+  Pat.printSubstitutions(SM, Buffer, SearchRange, MatchTy, nullptr);
 
   if (ExpectedMatch)
     Pat.printFuzzyMatch(SM, Buffer, Diags);
@@ -2066,8 +2315,12 @@ size_t FileCheckString::CheckDag(const SourceMgr &SM, StringRef Buffer,
           SM.PrintMessage(OldStart, SourceMgr::DK_Note,
                           "match discarded, overlaps earlier DAG match here",
                           {OldRange});
-        } else
-          Diags->rbegin()->MatchTy = FileCheckDiag::MatchFoundButDiscarded;
+        } else {
+          SMLoc CheckLoc = Diags->rbegin()->CheckLoc;
+          for (auto I = Diags->rbegin(), E = Diags->rend();
+               I != E && I->CheckLoc == CheckLoc; ++I)
+            I->MatchTy = FileCheckDiag::MatchFoundButDiscarded;
+        }
       }
       MatchPos = MI->End;
     }

@@ -26,6 +26,7 @@
 #include "clang/AST/NestedNameSpecifier.h"
 #include "clang/AST/OperationKinds.h"
 #include "clang/AST/Stmt.h"
+#include "clang/AST/StmtCXX.h"
 #include "clang/AST/TemplateBase.h"
 #include "clang/AST/Type.h"
 #include "clang/AST/UnresolvedSet.h"
@@ -91,20 +92,21 @@ class CXXOperatorCallExpr final : public CallExpr {
 
   CXXOperatorCallExpr(OverloadedOperatorKind OpKind, Expr *Fn,
                       ArrayRef<Expr *> Args, QualType Ty, ExprValueKind VK,
-                      SourceLocation OperatorLoc, FPOptions FPFeatures,
+                      SourceLocation OperatorLoc, FPOptionsOverride FPFeatures,
                       ADLCallKind UsesADL);
 
-  CXXOperatorCallExpr(unsigned NumArgs, EmptyShell Empty);
+  CXXOperatorCallExpr(unsigned NumArgs, bool HasFPFeatures, EmptyShell Empty);
 
 public:
   static CXXOperatorCallExpr *
   Create(const ASTContext &Ctx, OverloadedOperatorKind OpKind, Expr *Fn,
          ArrayRef<Expr *> Args, QualType Ty, ExprValueKind VK,
-         SourceLocation OperatorLoc, FPOptions FPFeatures,
+         SourceLocation OperatorLoc, FPOptionsOverride FPFeatures,
          ADLCallKind UsesADL = NotADL);
 
   static CXXOperatorCallExpr *CreateEmpty(const ASTContext &Ctx,
-                                          unsigned NumArgs, EmptyShell Empty);
+                                          unsigned NumArgs, bool HasFPFeatures,
+                                          EmptyShell Empty);
 
   /// Returns the kind of overloaded operator that this expression refers to.
   OverloadedOperatorKind getOperator() const {
@@ -162,21 +164,6 @@ public:
   static bool classof(const Stmt *T) {
     return T->getStmtClass() == CXXOperatorCallExprClass;
   }
-
-  // Set the FP contractability status of this operator. Only meaningful for
-  // operations on floating point types.
-  void setFPFeatures(FPOptions F) {
-    CXXOperatorCallExprBits.FPFeatures = F.getAsOpaqueInt();
-  }
-  FPOptions getFPFeatures() const {
-    return FPOptions(CXXOperatorCallExprBits.FPFeatures);
-  }
-
-  // Get the FP contractability status of this operator. Only meaningful for
-  // operations on floating point types.
-  bool isFPContractableWithinStatement() const {
-    return getFPFeatures().allowFPContractWithinStatement();
-  }
 };
 
 /// Represents a call to a member function that
@@ -192,18 +179,20 @@ class CXXMemberCallExpr final : public CallExpr {
   // to CallExpr. See CallExpr for the details.
 
   CXXMemberCallExpr(Expr *Fn, ArrayRef<Expr *> Args, QualType Ty,
-                    ExprValueKind VK, SourceLocation RP, unsigned MinNumArgs);
+                    ExprValueKind VK, SourceLocation RP,
+                    FPOptionsOverride FPOptions, unsigned MinNumArgs);
 
-  CXXMemberCallExpr(unsigned NumArgs, EmptyShell Empty);
+  CXXMemberCallExpr(unsigned NumArgs, bool HasFPFeatures, EmptyShell Empty);
 
 public:
   static CXXMemberCallExpr *Create(const ASTContext &Ctx, Expr *Fn,
                                    ArrayRef<Expr *> Args, QualType Ty,
                                    ExprValueKind VK, SourceLocation RP,
+                                   FPOptionsOverride FPFeatures,
                                    unsigned MinNumArgs = 0);
 
   static CXXMemberCallExpr *CreateEmpty(const ASTContext &Ctx, unsigned NumArgs,
-                                        EmptyShell Empty);
+                                        bool HasFPFeatures, EmptyShell Empty);
 
   /// Retrieve the implicit object argument for the member call.
   ///
@@ -250,18 +239,21 @@ class CUDAKernelCallExpr final : public CallExpr {
 
   CUDAKernelCallExpr(Expr *Fn, CallExpr *Config, ArrayRef<Expr *> Args,
                      QualType Ty, ExprValueKind VK, SourceLocation RP,
-                     unsigned MinNumArgs);
+                     FPOptionsOverride FPFeatures, unsigned MinNumArgs);
 
-  CUDAKernelCallExpr(unsigned NumArgs, EmptyShell Empty);
+  CUDAKernelCallExpr(unsigned NumArgs, bool HasFPFeatures, EmptyShell Empty);
 
 public:
   static CUDAKernelCallExpr *Create(const ASTContext &Ctx, Expr *Fn,
                                     CallExpr *Config, ArrayRef<Expr *> Args,
                                     QualType Ty, ExprValueKind VK,
-                                    SourceLocation RP, unsigned MinNumArgs = 0);
+                                    SourceLocation RP,
+                                    FPOptionsOverride FPFeatures,
+                                    unsigned MinNumArgs = 0);
 
   static CUDAKernelCallExpr *CreateEmpty(const ASTContext &Ctx,
-                                         unsigned NumArgs, EmptyShell Empty);
+                                         unsigned NumArgs, bool HasFPFeatures,
+                                         EmptyShell Empty);
 
   const CallExpr *getConfig() const {
     return cast_or_null<CallExpr>(getPreArg(CONFIG));
@@ -627,18 +619,20 @@ class UserDefinedLiteral final : public CallExpr {
 
   UserDefinedLiteral(Expr *Fn, ArrayRef<Expr *> Args, QualType Ty,
                      ExprValueKind VK, SourceLocation LitEndLoc,
-                     SourceLocation SuffixLoc);
+                     SourceLocation SuffixLoc, FPOptionsOverride FPFeatures);
 
-  UserDefinedLiteral(unsigned NumArgs, EmptyShell Empty);
+  UserDefinedLiteral(unsigned NumArgs, bool HasFPFeatures, EmptyShell Empty);
 
 public:
   static UserDefinedLiteral *Create(const ASTContext &Ctx, Expr *Fn,
                                     ArrayRef<Expr *> Args, QualType Ty,
                                     ExprValueKind VK, SourceLocation LitEndLoc,
-                                    SourceLocation SuffixLoc);
+                                    SourceLocation SuffixLoc,
+                                    FPOptionsOverride FPFeatures);
 
   static UserDefinedLiteral *CreateEmpty(const ASTContext &Ctx,
-                                         unsigned NumArgs, EmptyShell Empty);
+                                         unsigned NumArgs, bool HasFPOptions,
+                                         EmptyShell Empty);
 
   /// The kind of literal operator which is invoked.
   enum LiteralOperatorKind {
@@ -1829,25 +1823,13 @@ Stmt **CXXConstructExpr::getTrailingArgs() {
 /// and which can never occur implicitly.
 class LambdaExpr final : public Expr,
                          private llvm::TrailingObjects<LambdaExpr, Stmt *> {
+  // LambdaExpr has some data stored in LambdaExprBits.
+
   /// The source range that covers the lambda introducer ([...]).
   SourceRange IntroducerRange;
 
   /// The source location of this lambda's capture-default ('=' or '&').
   SourceLocation CaptureDefaultLoc;
-
-  /// The number of captures.
-  unsigned NumCaptures : 16;
-
-  /// The default capture kind, which is a value of type
-  /// LambdaCaptureDefault.
-  unsigned CaptureDefault : 2;
-
-  /// Whether this lambda had an explicit parameter list vs. an
-  /// implicit (and empty) parameter list.
-  unsigned ExplicitParams : 1;
-
-  /// Whether this lambda had the result type explicitly specified.
-  unsigned ExplicitResultType : 1;
 
   /// The location of the closing brace ('}') that completes
   /// the lambda.
@@ -1867,16 +1849,12 @@ class LambdaExpr final : public Expr,
              SourceLocation ClosingBrace, bool ContainsUnexpandedParameterPack);
 
   /// Construct an empty lambda expression.
-  LambdaExpr(EmptyShell Empty, unsigned NumCaptures)
-      : Expr(LambdaExprClass, Empty), NumCaptures(NumCaptures),
-        CaptureDefault(LCD_None), ExplicitParams(false),
-        ExplicitResultType(false) {
-    getStoredStmts()[NumCaptures] = nullptr;
-  }
+  LambdaExpr(EmptyShell Empty, unsigned NumCaptures);
 
   Stmt **getStoredStmts() { return getTrailingObjects<Stmt *>(); }
-
   Stmt *const *getStoredStmts() const { return getTrailingObjects<Stmt *>(); }
+
+  void initBodyIfNeeded() const;
 
 public:
   friend class ASTStmtReader;
@@ -1898,13 +1876,11 @@ public:
 
   /// Determine the default capture kind for this lambda.
   LambdaCaptureDefault getCaptureDefault() const {
-    return static_cast<LambdaCaptureDefault>(CaptureDefault);
+    return static_cast<LambdaCaptureDefault>(LambdaExprBits.CaptureDefault);
   }
 
   /// Retrieve the location of this lambda's capture-default, if any.
-  SourceLocation getCaptureDefaultLoc() const {
-    return CaptureDefaultLoc;
-  }
+  SourceLocation getCaptureDefaultLoc() const { return CaptureDefaultLoc; }
 
   /// Determine whether one of this lambda's captures is an init-capture.
   bool isInitCapture(const LambdaCapture *Capture) const;
@@ -1927,7 +1903,7 @@ public:
   capture_iterator capture_end() const;
 
   /// Determine the number of captures in this lambda.
-  unsigned capture_size() const { return NumCaptures; }
+  unsigned capture_size() const { return LambdaExprBits.NumCaptures; }
 
   /// Retrieve this lambda's explicit captures.
   capture_range explicit_captures() const;
@@ -1957,6 +1933,7 @@ public:
 
   /// Const iterator that walks over the capture initialization
   /// arguments.
+  /// FIXME: This interface is prone to being used incorrectly.
   using const_capture_init_iterator = Expr *const *;
 
   /// Retrieve the initialization expressions for this lambda's captures.
@@ -1984,13 +1961,13 @@ public:
   /// Retrieve the iterator pointing one past the last
   /// initialization argument for this lambda expression.
   capture_init_iterator capture_init_end() {
-    return capture_init_begin() + NumCaptures;
+    return capture_init_begin() + capture_size();
   }
 
   /// Retrieve the iterator pointing one past the last
   /// initialization argument for this lambda expression.
   const_capture_init_iterator capture_init_end() const {
-    return capture_init_begin() + NumCaptures;
+    return capture_init_begin() + capture_size();
   }
 
   /// Retrieve the source range covering the lambda introducer,
@@ -2024,8 +2001,20 @@ public:
   /// Whether this is a generic lambda.
   bool isGenericLambda() const { return getTemplateParameterList(); }
 
-  /// Retrieve the body of the lambda.
-  CompoundStmt *getBody() const;
+  /// Retrieve the body of the lambda. This will be most of the time
+  /// a \p CompoundStmt, but can also be \p CoroutineBodyStmt wrapping
+  /// a \p CompoundStmt. Note that unlike functions, lambda-expressions
+  /// cannot have a function-try-block.
+  Stmt *getBody() const;
+
+  /// Retrieve the \p CompoundStmt representing the body of the lambda.
+  /// This is a convenience function for callers who do not need
+  /// to handle node(s) which may wrap a \p CompoundStmt.
+  const CompoundStmt *getCompoundStmtBody() const;
+  CompoundStmt *getCompoundStmtBody() {
+    const auto *ConstThis = this;
+    return const_cast<CompoundStmt *>(ConstThis->getCompoundStmtBody());
+  }
 
   /// Determine whether the lambda is mutable, meaning that any
   /// captures values can be modified.
@@ -2033,10 +2022,12 @@ public:
 
   /// Determine whether this lambda has an explicit parameter
   /// list vs. an implicit (empty) parameter list.
-  bool hasExplicitParameters() const { return ExplicitParams; }
+  bool hasExplicitParameters() const { return LambdaExprBits.ExplicitParams; }
 
   /// Whether this lambda had its result type explicitly specified.
-  bool hasExplicitResultType() const { return ExplicitResultType; }
+  bool hasExplicitResultType() const {
+    return LambdaExprBits.ExplicitResultType;
+  }
 
   static bool classof(const Stmt *T) {
     return T->getStmtClass() == LambdaExprClass;
@@ -2048,15 +2039,9 @@ public:
 
   SourceLocation getEndLoc() const LLVM_READONLY { return ClosingBrace; }
 
-  child_range children() {
-    // Includes initialization exprs plus body stmt
-    return child_range(getStoredStmts(), getStoredStmts() + NumCaptures + 1);
-  }
-
-  const_child_range children() const {
-    return const_child_range(getStoredStmts(),
-                             getStoredStmts() + NumCaptures + 1);
-  }
+  /// Includes the captures and the body of the lambda.
+  child_range children();
+  const_child_range children() const;
 };
 
 /// An expression "T()" which creates a value-initialized rvalue of type
@@ -2749,6 +2734,8 @@ public:
       : Expr(ArrayTypeTraitExprClass, ty, VK_RValue, OK_Ordinary), ATT(att),
         Value(value), Dimension(dimension), Loc(loc), RParen(rparen),
         QueriedType(queried) {
+    assert(att <= ATT_Last && "invalid enum value!");
+    assert(static_cast<unsigned>(att) == ATT && "ATT overflow!");
     setDependence(computeDependence(this));
   }
 
@@ -2813,6 +2800,8 @@ public:
       : Expr(ExpressionTraitExprClass, resultType, VK_RValue, OK_Ordinary),
         ET(et), Value(value), Loc(loc), RParen(rparen),
         QueriedExpression(queried) {
+    assert(et <= ET_Last && "invalid enum value!");
+    assert(static_cast<unsigned>(et) == ET && "ET overflow!");
     setDependence(computeDependence(this));
   }
 
@@ -4530,31 +4519,38 @@ class CXXFoldExpr : public Expr {
   friend class ASTStmtReader;
   friend class ASTStmtWriter;
 
+  enum SubExpr { Callee, LHS, RHS, Count };
+
   SourceLocation LParenLoc;
   SourceLocation EllipsisLoc;
   SourceLocation RParenLoc;
   // When 0, the number of expansions is not known. Otherwise, this is one more
   // than the number of expansions.
   unsigned NumExpansions;
-  Stmt *SubExprs[2];
+  Stmt *SubExprs[SubExpr::Count];
   BinaryOperatorKind Opcode;
 
 public:
-  CXXFoldExpr(QualType T, SourceLocation LParenLoc, Expr *LHS,
-              BinaryOperatorKind Opcode, SourceLocation EllipsisLoc, Expr *RHS,
-              SourceLocation RParenLoc, Optional<unsigned> NumExpansions)
+  CXXFoldExpr(QualType T, UnresolvedLookupExpr *Callee,
+              SourceLocation LParenLoc, Expr *LHS, BinaryOperatorKind Opcode,
+              SourceLocation EllipsisLoc, Expr *RHS, SourceLocation RParenLoc,
+              Optional<unsigned> NumExpansions)
       : Expr(CXXFoldExprClass, T, VK_RValue, OK_Ordinary), LParenLoc(LParenLoc),
         EllipsisLoc(EllipsisLoc), RParenLoc(RParenLoc),
         NumExpansions(NumExpansions ? *NumExpansions + 1 : 0), Opcode(Opcode) {
-    SubExprs[0] = LHS;
-    SubExprs[1] = RHS;
+    SubExprs[SubExpr::Callee] = Callee;
+    SubExprs[SubExpr::LHS] = LHS;
+    SubExprs[SubExpr::RHS] = RHS;
     setDependence(computeDependence(this));
   }
 
   CXXFoldExpr(EmptyShell Empty) : Expr(CXXFoldExprClass, Empty) {}
 
-  Expr *getLHS() const { return static_cast<Expr*>(SubExprs[0]); }
-  Expr *getRHS() const { return static_cast<Expr*>(SubExprs[1]); }
+  UnresolvedLookupExpr *getCallee() const {
+    return static_cast<UnresolvedLookupExpr *>(SubExprs[SubExpr::Callee]);
+  }
+  Expr *getLHS() const { return static_cast<Expr*>(SubExprs[SubExpr::LHS]); }
+  Expr *getRHS() const { return static_cast<Expr*>(SubExprs[SubExpr::RHS]); }
 
   /// Does this produce a right-associated sequence of operators?
   bool isRightFold() const {
@@ -4579,19 +4575,33 @@ public:
     return None;
   }
 
-  SourceLocation getBeginLoc() const LLVM_READONLY { return LParenLoc; }
+  SourceLocation getBeginLoc() const LLVM_READONLY {
+    if (LParenLoc.isValid())
+      return LParenLoc;
+    if (isLeftFold())
+      return getEllipsisLoc();
+    return getLHS()->getBeginLoc();
+  }
 
-  SourceLocation getEndLoc() const LLVM_READONLY { return RParenLoc; }
+  SourceLocation getEndLoc() const LLVM_READONLY {
+    if (RParenLoc.isValid())
+      return RParenLoc;
+    if (isRightFold())
+      return getEllipsisLoc();
+    return getRHS()->getEndLoc();
+  }
 
   static bool classof(const Stmt *T) {
     return T->getStmtClass() == CXXFoldExprClass;
   }
 
   // Iterators
-  child_range children() { return child_range(SubExprs, SubExprs + 2); }
+  child_range children() {
+    return child_range(SubExprs, SubExprs + SubExpr::Count);
+  }
 
   const_child_range children() const {
-    return const_child_range(SubExprs, SubExprs + 2);
+    return const_child_range(SubExprs, SubExprs + SubExpr::Count);
   }
 };
 
@@ -4821,6 +4831,8 @@ public:
       : ExplicitCastExpr(BuiltinBitCastExprClass, T, VK, CK, SrcExpr, 0,
                          DstType),
         KWLoc(KWLoc), RParenLoc(RParenLoc) {}
+  BuiltinBitCastExpr(EmptyShell Empty)
+      : ExplicitCastExpr(BuiltinBitCastExprClass, Empty, 0) {}
 
   SourceLocation getBeginLoc() const LLVM_READONLY { return KWLoc; }
   SourceLocation getEndLoc() const LLVM_READONLY { return RParenLoc; }

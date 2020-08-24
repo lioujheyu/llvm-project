@@ -97,6 +97,15 @@ namespace llvm {
     ///
     XXSPLT,
 
+    /// XXSPLTI_SP_TO_DP - The PPC VSX splat instructions for immediates for
+    /// converting immediate single precision numbers to double precision
+    /// vector or scalar.
+    XXSPLTI_SP_TO_DP,
+
+    /// XXSPLTI32DX - The PPC XXSPLTI32DX instruction.
+    ///
+    XXSPLTI32DX,
+
     /// VECINSERT - The PPC vector insert instruction
     ///
     VECINSERT,
@@ -132,6 +141,10 @@ namespace llvm {
     /// compute an offset from native SP to the address  of the most recent
     /// dynamic alloca.
     DYNAREAOFFSET,
+
+    /// To avoid stack clash, allocation is performed by block and each block is
+    /// probed.
+    PROBED_ALLOCA,
 
     /// GlobalBaseReg - On Darwin, this node represents the result of the mflr
     /// at function entry, used for PIC code.
@@ -220,6 +233,14 @@ namespace llvm {
     /// Extract a subvector from unsigned integer vector and convert to FP.
     /// As with SINT_VEC_TO_FP, used for converting illegal types.
     UINT_VEC_TO_FP,
+
+    /// PowerPC instructions that have SCALAR_TO_VECTOR semantics tend to
+    /// place the value into the least significant element of the most
+    /// significant doubleword in the vector. This is not element zero for
+    /// anything smaller than a doubleword on either endianness. This node has
+    /// the same semantics as SCALAR_TO_VECTOR except that the value remains in
+    /// the aforementioned location in the vector register.
+    SCALAR_TO_VECTOR_PERMUTED,
 
     // FIXME: Remove these once the ANDI glue bug is fixed:
     /// i1 = ANDI_rec_1_[EQ|GT]_BIT(i32 or i64 x) - Represents the result of the
@@ -406,22 +427,6 @@ namespace llvm {
     ///               => VABSDUW((XVNEGSP a), (XVNEGSP b))
     VABSD,
 
-    /// QVFPERM = This corresponds to the QPX qvfperm instruction.
-    QVFPERM,
-
-    /// QVGPCI = This corresponds to the QPX qvgpci instruction.
-    QVGPCI,
-
-    /// QVALIGNI = This corresponds to the QPX qvaligni instruction.
-    QVALIGNI,
-
-    /// QVESPLATI = This corresponds to the QPX qvesplati instruction.
-    QVESPLATI,
-
-    /// QBFLT = Access the underlying QPX floating-point boolean
-    /// representation.
-    QBFLT,
-
     /// FP_EXTEND_HALF(VECTOR, IDX) - Custom extend upper (IDX=0) half or
     /// lower (IDX=1) half of v4f32 to v2f64.
     FP_EXTEND_HALF,
@@ -430,6 +435,23 @@ namespace llvm {
     /// either through an add like PADDI or through a PC Relative load like
     /// PLD.
     MAT_PCREL_ADDR,
+
+    /// TLS_DYNAMIC_MAT_PCREL_ADDR = Materialize a PC Relative address for
+    /// TLS global address when using dynamic access models. This can be done
+    /// through an add like PADDI.
+    TLS_DYNAMIC_MAT_PCREL_ADDR,
+
+    // Constrained conversion from floating point to int
+    STRICT_FCTIDZ = ISD::FIRST_TARGET_STRICTFP_OPCODE,
+    STRICT_FCTIWZ,
+    STRICT_FCTIDUZ,
+    STRICT_FCTIWUZ,
+
+    /// Constrained integer-to-floating-point conversion instructions.
+    STRICT_FCFID,
+    STRICT_FCFIDU,
+    STRICT_FCFIDS,
+    STRICT_FCFIDUS,
 
     /// CHAIN = STBRX CHAIN, GPRC, Ptr, Type - This is a
     /// byte-swapping store instruction.  It byte-swaps the low "Type" bits of
@@ -497,10 +519,6 @@ namespace llvm {
 
     /// Store scalar integers from VSR.
     ST_VSR_SCAL_INT,
-
-    /// QBRC, CHAIN = QVLFSb CHAIN, Ptr
-    /// The 4xf32 load used for v4i1 constants.
-    QVLFSb,
 
     /// ATOMIC_CMP_SWAP - the exact same as the target-independent nodes
     /// except they ensure that the compare input is zero-extended for
@@ -709,7 +727,7 @@ namespace llvm {
     /// Returns false if it can be represented by [r+imm], which are preferred.
     bool SelectAddressRegReg(SDValue N, SDValue &Base, SDValue &Index,
                              SelectionDAG &DAG,
-                             unsigned EncodingAlignment = 0) const;
+                             MaybeAlign EncodingAlignment = None) const;
 
     /// SelectAddressRegImm - Returns true if the address N can be represented
     /// by a base register plus a signed 16-bit displacement [r+imm], and if it
@@ -718,7 +736,7 @@ namespace llvm {
     /// requirement, i.e. multiples of 4 for DS form.
     bool SelectAddressRegImm(SDValue N, SDValue &Disp, SDValue &Base,
                              SelectionDAG &DAG,
-                             unsigned EncodingAlignment) const;
+                             MaybeAlign EncodingAlignment) const;
 
     /// SelectAddressRegRegOnly - Given the specified addressed, force it to be
     /// represented as an indexed [r+r] operation.
@@ -734,6 +752,12 @@ namespace llvm {
     /// LowerOperation - Provide custom lowering hooks for some operations.
     ///
     SDValue LowerOperation(SDValue Op, SelectionDAG &DAG) const override;
+
+    /// LowerOperationWrapper - Place custom new result values for node in
+    /// Results.
+    void LowerOperationWrapper(SDNode *N,
+                               SmallVectorImpl<SDValue> &Results,
+                               SelectionDAG &DAG) const override;
 
     /// ReplaceNodeResults - Replace the results of node with an illegal result
     /// type with new values built out of custom code.
@@ -790,6 +814,13 @@ namespace llvm {
 
     MachineBasicBlock *emitEHSjLjLongJmp(MachineInstr &MI,
                                          MachineBasicBlock *MBB) const;
+
+    MachineBasicBlock *emitProbedAlloca(MachineInstr &MI,
+                                        MachineBasicBlock *MBB) const;
+
+    bool hasInlineStackProbe(MachineFunction &MF) const override;
+
+    unsigned getStackProbeSize(MachineFunction &MF) const;
 
     ConstraintType getConstraintType(StringRef Constraint) const override;
 
@@ -1014,11 +1045,6 @@ namespace llvm {
       }
     };
 
-    bool isNoopAddrSpaceCast(unsigned SrcAS, unsigned DestAS) const override {
-      // Addrspacecasts are always noops.
-      return true;
-    }
-
     bool canReuseLoadAddress(SDValue Op, EVT MemVT, ReuseLoadInfo &RLI,
                              SelectionDAG &DAG,
                              ISD::LoadExtType ET = ISD::NON_EXTLOAD) const;
@@ -1089,13 +1115,13 @@ namespace llvm {
     SDValue LowerSHL_PARTS(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerSRL_PARTS(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerSRA_PARTS(SDValue Op, SelectionDAG &DAG) const;
+    SDValue LowerFunnelShift(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerBUILD_VECTOR(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerVECTOR_SHUFFLE(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerINSERT_VECTOR_ELT(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerEXTRACT_VECTOR_ELT(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerINTRINSIC_WO_CHAIN(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerINTRINSIC_VOID(SDValue Op, SelectionDAG &DAG) const;
-    SDValue LowerREM(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerBSWAP(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerATOMIC_CMP_SWAP(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerSCALAR_TO_VECTOR(SDValue Op, SelectionDAG &DAG) const;
@@ -1103,6 +1129,7 @@ namespace llvm {
     SDValue LowerMUL(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerABS(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerFP_EXTEND(SDValue Op, SelectionDAG &DAG) const;
+    SDValue LowerROTL(SDValue Op, SelectionDAG &DAG) const;
 
     SDValue LowerVectorLoad(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerVectorStore(SDValue Op, SelectionDAG &DAG) const;
@@ -1214,6 +1241,8 @@ namespace llvm {
     SDValue combineSetCC(SDNode *N, DAGCombinerInfo &DCI) const;
     SDValue combineABS(SDNode *N, DAGCombinerInfo &DCI) const;
     SDValue combineVSelect(SDNode *N, DAGCombinerInfo &DCI) const;
+    SDValue combineVectorShuffle(ShuffleVectorSDNode *SVN,
+                                 SelectionDAG &DAG) const;
     SDValue combineVReverseMemOP(ShuffleVectorSDNode *SVN, LSBaseSDNode *LSBase,
                                  DAGCombinerInfo &DCI) const;
 
@@ -1244,6 +1273,10 @@ namespace llvm {
     /// essentially v16i8 vector version of VINSERTH.
     SDValue lowerToVINSERTB(ShuffleVectorSDNode *N, SelectionDAG &DAG) const;
 
+    /// lowerToXXSPLTI32DX - Return the SDValue if this VECTOR_SHUFFLE can be
+    /// handled by the XXSPLTI32DX instruction introduced in ISA 3.1.
+    SDValue lowerToXXSPLTI32DX(ShuffleVectorSDNode *N, SelectionDAG &DAG) const;
+
     // Return whether the call instruction can potentially be optimized to a
     // tail call. This will cause the optimizers to attempt to move, or
     // duplicate return instructions to help enable tail call optimizations.
@@ -1261,6 +1294,9 @@ namespace llvm {
 
   bool isIntS16Immediate(SDNode *N, int16_t &Imm);
   bool isIntS16Immediate(SDValue Op, int16_t &Imm);
+
+  bool convertToNonDenormSingle(APInt &ArgAPInt);
+  bool convertToNonDenormSingle(APFloat &ArgAPFloat);
 
 } // end namespace llvm
 

@@ -539,12 +539,12 @@ void LoopIdiomRecognize::collectStores(BasicBlock *BB) {
       break;
     case LegalStoreKind::Memset: {
       // Find the base pointer.
-      Value *Ptr = GetUnderlyingObject(SI->getPointerOperand(), *DL);
+      Value *Ptr = getUnderlyingObject(SI->getPointerOperand());
       StoreRefsForMemset[Ptr].push_back(SI);
     } break;
     case LegalStoreKind::MemsetPattern: {
       // Find the base pointer.
-      Value *Ptr = GetUnderlyingObject(SI->getPointerOperand(), *DL);
+      Value *Ptr = getUnderlyingObject(SI->getPointerOperand());
       StoreRefsForMemsetPattern[Ptr].push_back(SI);
     } break;
     case LegalStoreKind::Memcpy:
@@ -908,10 +908,12 @@ bool LoopIdiomRecognize::processLoopStridedStore(
   BasicBlock *Preheader = CurLoop->getLoopPreheader();
   IRBuilder<> Builder(Preheader->getTerminator());
   SCEVExpander Expander(*SE, *DL, "loop-idiom");
+  SCEVExpanderCleaner ExpCleaner(Expander, *DT);
 
   Type *DestInt8PtrTy = Builder.getInt8PtrTy(DestAS);
   Type *IntIdxTy = DL->getIndexType(DestPtr->getType());
 
+  bool Changed = false;
   const SCEV *Start = Ev->getStart();
   // Handle negative strided loops.
   if (NegStride)
@@ -920,7 +922,7 @@ bool LoopIdiomRecognize::processLoopStridedStore(
   // TODO: ideally we should still be able to generate memset if SCEV expander
   // is taught to generate the dependencies at the latest point.
   if (!isSafeToExpand(Start, *SE))
-    return false;
+    return Changed;
 
   // Okay, we have a strided store "p[i]" of a splattable value.  We can turn
   // this into a memset in the loop preheader now if we want.  However, this
@@ -929,16 +931,22 @@ bool LoopIdiomRecognize::processLoopStridedStore(
   // base pointer and checking the region.
   Value *BasePtr =
       Expander.expandCodeFor(Start, DestInt8PtrTy, Preheader->getTerminator());
+
+  // From here on out, conservatively report to the pass manager that we've
+  // changed the IR, even if we later clean up these added instructions. There
+  // may be structural differences e.g. in the order of use lists not accounted
+  // for in just a textual dump of the IR. This is written as a variable, even
+  // though statically all the places this dominates could be replaced with
+  // 'true', with the hope that anyone trying to be clever / "more precise" with
+  // the return value will read this comment, and leave them alone.
+  Changed = true;
+
   if (mayLoopAccessLocation(BasePtr, ModRefInfo::ModRef, CurLoop, BECount,
-                            StoreSize, *AA, Stores)) {
-    Expander.clear();
-    // If we generated new code for the base pointer, clean up.
-    RecursivelyDeleteTriviallyDeadInstructions(BasePtr, TLI);
-    return false;
-  }
+                            StoreSize, *AA, Stores))
+    return Changed;
 
   if (avoidLIRForMultiBlockLoop(/*IsMemset=*/true, IsLoopMemset))
-    return false;
+    return Changed;
 
   // Okay, everything looks good, insert the memset.
 
@@ -948,7 +956,7 @@ bool LoopIdiomRecognize::processLoopStridedStore(
   // TODO: ideally we should still be able to generate memset if SCEV expander
   // is taught to generate the dependencies at the latest point.
   if (!isSafeToExpand(NumBytesS, *SE))
-    return false;
+    return Changed;
 
   Value *NumBytes =
       Expander.expandCodeFor(NumBytesS, IntIdxTy, Preheader->getTerminator());
@@ -1007,6 +1015,7 @@ bool LoopIdiomRecognize::processLoopStridedStore(
   if (MSSAU && VerifyMemorySSA)
     MSSAU->getMemorySSA()->verifyMemorySSA();
   ++NumMemSet;
+  ExpCleaner.markResultUsed();
   return true;
 }
 
@@ -1040,6 +1049,9 @@ bool LoopIdiomRecognize::processLoopStoreOfLoopLoad(StoreInst *SI,
   IRBuilder<> Builder(Preheader->getTerminator());
   SCEVExpander Expander(*SE, *DL, "loop-idiom");
 
+  SCEVExpanderCleaner ExpCleaner(Expander, *DT);
+
+  bool Changed = false;
   const SCEV *StrStart = StoreEv->getStart();
   unsigned StrAS = SI->getPointerAddressSpace();
   Type *IntIdxTy = Builder.getIntNTy(DL->getIndexSizeInBits(StrAS));
@@ -1057,15 +1069,20 @@ bool LoopIdiomRecognize::processLoopStoreOfLoopLoad(StoreInst *SI,
   Value *StoreBasePtr = Expander.expandCodeFor(
       StrStart, Builder.getInt8PtrTy(StrAS), Preheader->getTerminator());
 
+  // From here on out, conservatively report to the pass manager that we've
+  // changed the IR, even if we later clean up these added instructions. There
+  // may be structural differences e.g. in the order of use lists not accounted
+  // for in just a textual dump of the IR. This is written as a variable, even
+  // though statically all the places this dominates could be replaced with
+  // 'true', with the hope that anyone trying to be clever / "more precise" with
+  // the return value will read this comment, and leave them alone.
+  Changed = true;
+
   SmallPtrSet<Instruction *, 1> Stores;
   Stores.insert(SI);
   if (mayLoopAccessLocation(StoreBasePtr, ModRefInfo::ModRef, CurLoop, BECount,
-                            StoreSize, *AA, Stores)) {
-    Expander.clear();
-    // If we generated new code for the base pointer, clean up.
-    RecursivelyDeleteTriviallyDeadInstructions(StoreBasePtr, TLI);
-    return false;
-  }
+                            StoreSize, *AA, Stores))
+    return Changed;
 
   const SCEV *LdStart = LoadEv->getStart();
   unsigned LdAS = LI->getPointerAddressSpace();
@@ -1080,16 +1097,11 @@ bool LoopIdiomRecognize::processLoopStoreOfLoopLoad(StoreInst *SI,
       LdStart, Builder.getInt8PtrTy(LdAS), Preheader->getTerminator());
 
   if (mayLoopAccessLocation(LoadBasePtr, ModRefInfo::Mod, CurLoop, BECount,
-                            StoreSize, *AA, Stores)) {
-    Expander.clear();
-    // If we generated new code for the base pointer, clean up.
-    RecursivelyDeleteTriviallyDeadInstructions(LoadBasePtr, TLI);
-    RecursivelyDeleteTriviallyDeadInstructions(StoreBasePtr, TLI);
-    return false;
-  }
+                            StoreSize, *AA, Stores))
+    return Changed;
 
   if (avoidLIRForMultiBlockLoop())
-    return false;
+    return Changed;
 
   // Okay, everything is safe, we can transform this!
 
@@ -1112,14 +1124,14 @@ bool LoopIdiomRecognize::processLoopStoreOfLoopLoad(StoreInst *SI,
     const Align StoreAlign = SI->getAlign();
     const Align LoadAlign = LI->getAlign();
     if (StoreAlign < StoreSize || LoadAlign < StoreSize)
-      return false;
+      return Changed;
 
     // If the element.atomic memcpy is not lowered into explicit
     // loads/stores later, then it will be lowered into an element-size
     // specific lib call. If the lib call doesn't exist for our store size, then
     // we shouldn't generate the memcpy.
     if (StoreSize > TTI->getAtomicMemIntrinsicMaxElementSize())
-      return false;
+      return Changed;
 
     // Create the call.
     // Note that unordered atomic loads/stores are *required* by the spec to
@@ -1157,6 +1169,7 @@ bool LoopIdiomRecognize::processLoopStoreOfLoopLoad(StoreInst *SI,
   if (MSSAU && VerifyMemorySSA)
     MSSAU->getMemorySSA()->verifyMemorySSA();
   ++NumMemCpy;
+  ExpCleaner.markResultUsed();
   return true;
 }
 
@@ -1533,9 +1546,9 @@ bool LoopIdiomRecognize::recognizeAndInsertFFS() {
   //  %inc = add nsw %i.0, 1
   //  br i1 %tobool
 
-  Value *Args[] =
-      {InitX, ZeroCheck ? ConstantInt::getTrue(InitX->getContext())
-                        : ConstantInt::getFalse(InitX->getContext())};
+  const Value *Args[] = {
+      InitX, ZeroCheck ? ConstantInt::getTrue(InitX->getContext())
+                       : ConstantInt::getFalse(InitX->getContext())};
 
   // @llvm.dbg doesn't count as they have no semantic effect.
   auto InstWithoutDebugIt = CurLoop->getHeader()->instructionsWithoutDebug();

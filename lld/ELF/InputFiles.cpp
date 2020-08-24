@@ -110,6 +110,7 @@ Optional<MemoryBufferRef> elf::readFile(StringRef path) {
     path = saver.save(config->chroot + path);
 
   log(path);
+  config->dependencyFiles.insert(llvm::CachedHashString(path));
 
   auto mbOrErr = MemoryBuffer::getFile(path, -1, false);
   if (auto ec = mbOrErr.getError()) {
@@ -632,6 +633,8 @@ void ObjFile<ELFT>::initializeSections(bool ignoreComdats) {
       break;
     case SHT_SYMTAB:
     case SHT_STRTAB:
+    case SHT_REL:
+    case SHT_RELA:
     case SHT_NULL:
       break;
     default:
@@ -639,22 +642,34 @@ void ObjFile<ELFT>::initializeSections(bool ignoreComdats) {
     }
   }
 
-  // This block handles SHF_LINK_ORDER.
+  // We have a second loop. It is used to:
+  // 1) handle SHF_LINK_ORDER sections.
+  // 2) create SHT_REL[A] sections. In some cases the section header index of a
+  //    relocation section may be smaller than that of the relocated section. In
+  //    such cases, the relocation section would attempt to reference a target
+  //    section that has not yet been created. For simplicity, delay creation of
+  //    relocation sections until now.
   for (size_t i = 0, e = objSections.size(); i < e; ++i) {
     if (this->sections[i] == &InputSection::discarded)
       continue;
     const Elf_Shdr &sec = objSections[i];
-    if (!(sec.sh_flags & SHF_LINK_ORDER))
+
+    if (sec.sh_type == SHT_REL || sec.sh_type == SHT_RELA)
+      this->sections[i] = createInputSection(sec);
+
+    // A SHF_LINK_ORDER section with sh_link=0 is handled as if it did not have
+    // the flag.
+    if (!(sec.sh_flags & SHF_LINK_ORDER) || !sec.sh_link)
       continue;
 
-    // .ARM.exidx sections have a reverse dependency on the InputSection they
-    // have a SHF_LINK_ORDER dependency, this is identified by the sh_link.
     InputSectionBase *linkSec = nullptr;
     if (sec.sh_link < this->sections.size())
       linkSec = this->sections[sec.sh_link];
     if (!linkSec)
       fatal(toString(this) + ": invalid sh_link index: " + Twine(sec.sh_link));
 
+    // A SHF_LINK_ORDER section is discarded if its linked-to section is
+    // discarded.
     InputSection *isec = cast<InputSection>(this->sections[i]);
     linkSec->dependentSections.push_back(isec);
     if (!isa<InputSection>(linkSec))
@@ -914,20 +929,6 @@ InputSectionBase *ObjFile<ELFT>::createInputSection(const Elf_Shdr &sec) {
       this->sections[sec.sh_info] = target;
     }
 
-    // This section contains relocation information.
-    // If -r is given, we do not interpret or apply relocation
-    // but just copy relocation sections to output.
-    if (config->relocatable) {
-      InputSection *relocSec = make<InputSection>(*this, sec, name);
-      // We want to add a dependency to target, similar like we do for
-      // -emit-relocs below. This is useful for the case when linker script
-      // contains the "/DISCARD/". It is perhaps uncommon to use a script with
-      // -r, but we faced it in the Linux kernel and have to handle such case
-      // and not to crash.
-      target->dependentSections.push_back(relocSec);
-      return relocSec;
-    }
-
     if (target->firstRelocation)
       fatal(toString(this) +
             ": multiple relocation sections to one section are not supported");
@@ -945,17 +946,17 @@ InputSectionBase *ObjFile<ELFT>::createInputSection(const Elf_Shdr &sec) {
     }
     assert(isUInt<31>(target->numRelocations));
 
-    // Relocation sections processed by the linker are usually removed
-    // from the output, so returning `nullptr` for the normal case.
-    // However, if -emit-relocs is given, we need to leave them in the output.
-    // (Some post link analysis tools need this information.)
-    if (config->emitRelocs) {
-      InputSection *relocSec = make<InputSection>(*this, sec, name);
-      // We will not emit relocation section if target was discarded.
-      target->dependentSections.push_back(relocSec);
-      return relocSec;
-    }
-    return nullptr;
+    // Relocation sections are usually removed from the output, so return
+    // `nullptr` for the normal case. However, if -r or --emit-relocs is
+    // specified, we need to copy them to the output. (Some post link analysis
+    // tools specify --emit-relocs to obtain the information.)
+    if (!config->relocatable && !config->emitRelocs)
+      return nullptr;
+    InputSection *relocSec = make<InputSection>(*this, sec, name);
+    // If the relocated section is discarded (due to /DISCARD/ or
+    // --gc-sections), the relocation section should be discarded as well.
+    target->dependentSections.push_back(relocSec);
+    return relocSec;
   }
   }
 
@@ -1049,50 +1050,67 @@ template <class ELFT> void ObjFile<ELFT>::initializeSymbols() {
   ArrayRef<Elf_Sym> eSyms = this->getELFSyms<ELFT>();
   this->symbols.resize(eSyms.size());
 
-  // Our symbol table may have already been partially initialized
+  // Fill in InputFile::symbols. Some entries have been initialized
   // because of LazyObjFile.
-  for (size_t i = 0, end = eSyms.size(); i != end; ++i)
-    if (!this->symbols[i] && eSyms[i].getBinding() != STB_LOCAL)
-      this->symbols[i] =
-          symtab->insert(CHECK(eSyms[i].getName(this->stringTable), this));
-
-  // Fill this->Symbols. A symbol is either local or global.
   for (size_t i = 0, end = eSyms.size(); i != end; ++i) {
+    if (this->symbols[i])
+      continue;
     const Elf_Sym &eSym = eSyms[i];
-
-    // Read symbol attributes.
     uint32_t secIdx = getSectionIndex(eSym);
     if (secIdx >= this->sections.size())
       fatal(toString(this) + ": invalid section index: " + Twine(secIdx));
+    if (eSym.getBinding() != STB_LOCAL) {
+      if (i < firstGlobal)
+        error(toString(this) + ": non-local symbol (" + Twine(i) +
+              ") found at index < .symtab's sh_info (" + Twine(firstGlobal) +
+              ")");
+      this->symbols[i] =
+          symtab->insert(CHECK(eSyms[i].getName(this->stringTable), this));
+      continue;
+    }
+
+    // Handle local symbols. Local symbols are not added to the symbol
+    // table because they are not visible from other object files. We
+    // allocate symbol instances and add their pointers to symbols.
+    if (i >= firstGlobal)
+      errorOrWarn(toString(this) + ": STB_LOCAL symbol (" + Twine(i) +
+                  ") found at index >= .symtab's sh_info (" +
+                  Twine(firstGlobal) + ")");
 
     InputSectionBase *sec = this->sections[secIdx];
+    uint8_t type = eSym.getType();
+    if (type == STT_FILE)
+      sourceFile = CHECK(eSym.getName(this->stringTable), this);
+    if (this->stringTable.size() <= eSym.st_name)
+      fatal(toString(this) + ": invalid symbol name offset");
+    StringRefZ name = this->stringTable.data() + eSym.st_name;
+
+    if (eSym.st_shndx == SHN_UNDEF)
+      this->symbols[i] =
+          make<Undefined>(this, name, STB_LOCAL, eSym.st_other, type);
+    else if (sec == &InputSection::discarded)
+      this->symbols[i] =
+          make<Undefined>(this, name, STB_LOCAL, eSym.st_other, type,
+                          /*discardedSecIdx=*/secIdx);
+    else
+      this->symbols[i] = make<Defined>(this, name, STB_LOCAL, eSym.st_other,
+                                       type, eSym.st_value, eSym.st_size, sec);
+  }
+
+  // Symbol resolution of non-local symbols.
+  for (size_t i = firstGlobal, end = eSyms.size(); i != end; ++i) {
+    const Elf_Sym &eSym = eSyms[i];
     uint8_t binding = eSym.getBinding();
+    if (binding == STB_LOCAL)
+      continue; // Errored above.
+
+    uint32_t secIdx = getSectionIndex(eSym);
+    InputSectionBase *sec = this->sections[secIdx];
     uint8_t stOther = eSym.st_other;
     uint8_t type = eSym.getType();
     uint64_t value = eSym.st_value;
     uint64_t size = eSym.st_size;
     StringRefZ name = this->stringTable.data() + eSym.st_name;
-
-    // Handle local symbols. Local symbols are not added to the symbol
-    // table because they are not visible from other object files. We
-    // allocate symbol instances and add their pointers to Symbols.
-    if (binding == STB_LOCAL) {
-      if (eSym.getType() == STT_FILE)
-        sourceFile = CHECK(eSym.getName(this->stringTable), this);
-
-      if (this->stringTable.size() <= eSym.st_name)
-        fatal(toString(this) + ": invalid symbol name offset");
-
-      if (eSym.st_shndx == SHN_UNDEF)
-        this->symbols[i] = make<Undefined>(this, name, binding, stOther, type);
-      else if (sec == &InputSection::discarded)
-        this->symbols[i] = make<Undefined>(this, name, binding, stOther, type,
-                                           /*DiscardedSecIdx=*/secIdx);
-      else
-        this->symbols[i] =
-            make<Defined>(this, name, binding, stOther, type, value, size, sec);
-      continue;
-    }
 
     // Handle global undefined symbols.
     if (eSym.st_shndx == SHN_UNDEF) {
@@ -1694,8 +1712,9 @@ template <class ELFT> void LazyObjFile::parse() {
         continue;
       sym->resolve(LazyObject{*this, sym->getName()});
 
-      // MemoryBuffer is emptied if this file is instantiated as ObjFile.
-      if (mb.getBuffer().empty())
+      // If fetched, stop iterating because this->symbols has been transferred
+      // to the instantiated ObjFile.
+      if (fetched)
         return;
     }
     return;

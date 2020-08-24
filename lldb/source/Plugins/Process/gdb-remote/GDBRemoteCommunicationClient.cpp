@@ -841,7 +841,7 @@ int GDBRemoteCommunicationClient::SendEnvironmentPacket(
     bool send_hex_encoding = false;
     for (const char *p = name_equal_value; *p != '\0' && !send_hex_encoding;
          ++p) {
-      if (isprint(*p)) {
+      if (llvm::isPrint(*p)) {
         switch (*p) {
         case '$':
         case '#':
@@ -1053,7 +1053,7 @@ void GDBRemoteCommunicationClient::MaybeEnableCompression(
   }
 #endif
 
-#if defined(HAVE_LIBZ)
+#if LLVM_ENABLE_ZLIB
   if (avail_type == CompressionType::None) {
     for (auto compression : supported_compressions) {
       if (compression == "zlib-deflate") {
@@ -2120,6 +2120,7 @@ bool GDBRemoteCommunicationClient::GetCurrentProcessInfo(bool allow_lazy) {
         case llvm::Triple::COFF:
           m_process_arch.SetArchitecture(eArchTypeCOFF, cpu, sub);
           break;
+        case llvm::Triple::GOFF:
         case llvm::Triple::Wasm:
         case llvm::Triple::XCOFF:
           LLDB_LOGF(log, "error: not supported target architecture");

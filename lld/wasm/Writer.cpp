@@ -224,7 +224,16 @@ void Writer::layoutMemory() {
     log("mem: stack base  = " + Twine(memoryPtr));
     memoryPtr += config->zStackSize;
     auto *sp = cast<DefinedGlobal>(WasmSym::stackPointer);
-    sp->global->global.InitExpr.Value.Int32 = memoryPtr;
+    switch (sp->global->global.InitExpr.Opcode) {
+    case WASM_OPCODE_I32_CONST:
+      sp->global->global.InitExpr.Value.Int32 = memoryPtr;
+      break;
+    case WASM_OPCODE_I64_CONST:
+      sp->global->global.InitExpr.Value.Int64 = memoryPtr;
+      break;
+    default:
+      llvm_unreachable("init expr must be i32/i64.const");
+    }
     log("mem: stack top   = " + Twine(memoryPtr));
   };
 
@@ -256,10 +265,13 @@ void Writer::layoutMemory() {
 
     if (WasmSym::tlsSize && seg->name == ".tdata") {
       auto *tlsSize = cast<DefinedGlobal>(WasmSym::tlsSize);
+      assert(tlsSize->global->global.InitExpr.Opcode == WASM_OPCODE_I32_CONST);
       tlsSize->global->global.InitExpr.Value.Int32 = seg->size;
 
       auto *tlsAlign = cast<DefinedGlobal>(WasmSym::tlsAlign);
-      tlsAlign->global->global.InitExpr.Value.Int32 = 1U << seg->alignment;
+      assert(tlsAlign->global->global.InitExpr.Opcode == WASM_OPCODE_I32_CONST);
+      tlsAlign->global->global.InitExpr.Value.Int32 = int64_t{1}
+                                                      << seg->alignment;
     }
   }
 
@@ -292,13 +304,17 @@ void Writer::layoutMemory() {
   if (WasmSym::heapBase)
     WasmSym::heapBase->setVirtualAddress(memoryPtr);
 
+  uint64_t maxMemorySetting = 1ULL
+                              << (config->is64.getValueOr(false) ? 48 : 32);
+
   if (config->initialMemory != 0) {
     if (config->initialMemory != alignTo(config->initialMemory, WasmPageSize))
       error("initial memory must be " + Twine(WasmPageSize) + "-byte aligned");
     if (memoryPtr > config->initialMemory)
       error("initial memory too small, " + Twine(memoryPtr) + " bytes needed");
-    if (config->initialMemory > (1ULL << 32))
-      error("initial memory too large, cannot be greater than 4294967296");
+    if (config->initialMemory > maxMemorySetting)
+      error("initial memory too large, cannot be greater than " +
+            Twine(maxMemorySetting));
     memoryPtr = config->initialMemory;
   }
   out.dylinkSec->memSize = memoryPtr;
@@ -312,8 +328,9 @@ void Writer::layoutMemory() {
       error("maximum memory must be " + Twine(WasmPageSize) + "-byte aligned");
     if (memoryPtr > config->maxMemory)
       error("maximum memory too small, " + Twine(memoryPtr) + " bytes needed");
-    if (config->maxMemory > (1ULL << 32))
-      error("maximum memory too large, cannot be greater than 4294967296");
+    if (config->maxMemory > maxMemorySetting)
+      error("maximum memory too large, cannot be greater than " +
+            Twine(maxMemorySetting));
     out.memorySec->maxMemoryPages = config->maxMemory / WasmPageSize;
     log("mem: max pages   = " + Twine(out.memorySec->maxMemoryPages));
   }
@@ -337,8 +354,8 @@ static void addStartStopSymbols(const OutputSegment *seg) {
   if (!isValidCIdentifier(name))
     return;
   LLVM_DEBUG(dbgs() << "addStartStopSymbols: " << name << "\n");
-  uint32_t start = seg->startVA;
-  uint32_t stop = start + seg->size;
+  uint64_t start = seg->startVA;
+  uint64_t stop = start + seg->size;
   symtab->addOptionalDataSymbol(saver.save("__start_" + name), start);
   symtab->addOptionalDataSymbol(saver.save("__stop_" + name), stop);
 }
@@ -821,7 +838,12 @@ void Writer::createInitMemoryFunction() {
       for (const OutputSegment *s : segments) {
         if (needsPassiveInitialization(s)) {
           // destination address
-          writeI32Const(os, s->startVA, "destination address");
+          if (config->is64.getValueOr(false)) {
+            writeI64Const(os, s->startVA, "destination address");
+          } else {
+            writeI32Const(os, static_cast<int32_t>(s->startVA),
+                          "destination address");
+          }
           // source segment offset
           writeI32Const(os, 0, "segment offset");
           // memory region size
@@ -909,6 +931,9 @@ void Writer::createCallCtorsFunction() {
     for (const WasmInitEntry &f : initFunctions) {
       writeU8(os, WASM_OPCODE_CALL, "CALL");
       writeUleb128(os, f.sym->getFunctionIndex(), "function index");
+      for (size_t i = 0; i < f.sym->signature->Returns.size(); i++) {
+        writeU8(os, WASM_OPCODE_DROP, "DROP");
+      }
     }
     writeU8(os, WASM_OPCODE_END, "END");
   }
@@ -940,6 +965,7 @@ void Writer::createInitTLSFunction() {
       writeU8(os, WASM_OPCODE_GLOBAL_SET, "global.set");
       writeUleb128(os, WasmSym::tlsBase->getGlobalIndex(), "global index");
 
+      // FIXME(wvo): this local needs to be I64 in wasm64, or we need an extend op.
       writeU8(os, WASM_OPCODE_LOCAL_GET, "local.get");
       writeUleb128(os, 0, "local index");
 
@@ -973,8 +999,8 @@ void Writer::calculateInitFunctions() {
       if (sym->isDiscarded())
         continue;
       assert(sym->isLive());
-      if (*sym->signature != WasmSignature{{}, {}})
-        error("invalid signature for init func: " + toString(*sym));
+      if (sym->signature->Params.size() != 0)
+        error("constructor functions cannot take arguments: " + toString(*sym));
       LLVM_DEBUG(dbgs() << "initFunctions: " << toString(*sym) << "\n");
       initFunctions.emplace_back(WasmInitEntry{sym, f.Priority});
     }

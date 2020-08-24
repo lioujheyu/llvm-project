@@ -106,6 +106,7 @@ std::string SDNode::getOperationName(const SelectionDAG *G) const {
   case ISD::TokenFactor:                return "TokenFactor";
   case ISD::AssertSext:                 return "AssertSext";
   case ISD::AssertZext:                 return "AssertZext";
+  case ISD::AssertAlign:                return "AssertAlign";
 
   case ISD::BasicBlock:                 return "BasicBlock";
   case ISD::VALUETYPE:                  return "ValueType";
@@ -309,6 +310,8 @@ std::string SDNode::getOperationName(const SelectionDAG *G) const {
   case ISD::UADDSAT:                    return "uaddsat";
   case ISD::SSUBSAT:                    return "ssubsat";
   case ISD::USUBSAT:                    return "usubsat";
+  case ISD::SSHLSAT:                    return "sshlsat";
+  case ISD::USHLSAT:                    return "ushlsat";
 
   case ISD::SMULFIX:                    return "smulfix";
   case ISD::SMULFIXSAT:                 return "smulfixsat";

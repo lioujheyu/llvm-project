@@ -20,10 +20,36 @@ class LLVMTypeConverter;
 class MLIRContext;
 class ModuleOp;
 
+template <typename SPIRVOp>
+class SPIRVToLLVMConversion : public OpConversionPattern<SPIRVOp> {
+public:
+  SPIRVToLLVMConversion(MLIRContext *context, LLVMTypeConverter &typeConverter,
+                        PatternBenefit benefit = 1)
+      : OpConversionPattern<SPIRVOp>(context, benefit),
+        typeConverter(typeConverter) {}
+
+protected:
+  LLVMTypeConverter &typeConverter;
+};
+
+/// Populates type conversions with additional SPIR-V types.
+void populateSPIRVToLLVMTypeConversion(LLVMTypeConverter &typeConverter);
+
 /// Populates the given list with patterns that convert from SPIR-V to LLVM.
 void populateSPIRVToLLVMConversionPatterns(MLIRContext *context,
                                            LLVMTypeConverter &typeConverter,
                                            OwningRewritePatternList &patterns);
+
+/// Populates the given list with patterns for function conversion from SPIR-V
+/// to LLVM.
+void populateSPIRVToLLVMFunctionConversionPatterns(
+    MLIRContext *context, LLVMTypeConverter &typeConverter,
+    OwningRewritePatternList &patterns);
+
+/// Populates the given patterns for module conversion from SPIR-V to LLVM.
+void populateSPIRVToLLVMModuleConversionPatterns(
+    MLIRContext *context, LLVMTypeConverter &typeConverter,
+    OwningRewritePatternList &patterns);
 
 } // namespace mlir
 

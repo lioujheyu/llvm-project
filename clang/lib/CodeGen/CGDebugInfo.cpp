@@ -606,6 +606,7 @@ void CGDebugInfo::CreateCompileUnit() {
   case codegenoptions::DebugInfoConstructor:
   case codegenoptions::LimitedDebugInfo:
   case codegenoptions::FullDebugInfo:
+  case codegenoptions::UnusedTypeInfo:
     EmissionKind = llvm::DICompileUnit::FullDebug;
     break;
   }
@@ -2296,12 +2297,19 @@ static bool shouldOmitDefinition(codegenoptions::DebugInfoKind DebugKind,
   // In constructor debug mode, only emit debug info for a class when its
   // constructor is emitted. Skip this optimization if the class or any of
   // its methods are marked dllimport.
+  //
+  // This applies to classes that don't have any trivial constructors and have
+  // at least one constructor.
   if (DebugKind == codegenoptions::DebugInfoConstructor &&
       !CXXDecl->isLambda() && !CXXDecl->hasConstexprNonCopyMoveConstructor() &&
-      !isClassOrMethodDLLImport(CXXDecl))
+      !isClassOrMethodDLLImport(CXXDecl)) {
+    if (CXXDecl->ctors().empty())
+      return false;
     for (const auto *Ctor : CXXDecl->ctors())
-      if (Ctor->isUserProvided())
-        return true;
+      if (Ctor->isTrivial() && !Ctor->isCopyOrMoveConstructor())
+        return false;
+    return true;
+  }
 
   TemplateSpecializationKind Spec = TSK_Undeclared;
   if (const auto *SD = dyn_cast<ClassTemplateSpecializationDecl>(RD))
@@ -2535,10 +2543,14 @@ llvm::DIModule *CGDebugInfo::getOrCreateModuleRef(ASTSourceDescriptor Mod,
     // PCH files don't have a signature field in the control block,
     // but LLVM detects skeleton CUs by looking for a non-zero DWO id.
     // We use the lower 64 bits for debug info.
-    uint64_t Signature =
-        Mod.getSignature()
-            ? (uint64_t)Mod.getSignature()[1] << 32 | Mod.getSignature()[0]
-            : ~1ULL;
+
+    uint64_t Signature = 0;
+    if (const auto &ModSig = Mod.getSignature()) {
+      for (unsigned I = 0; I != sizeof(Signature); ++I)
+        Signature |= (uint64_t)ModSig[I] << (I * 8);
+    } else {
+      Signature = ~1ULL;
+    }
     llvm::DIBuilder DIB(CGM.getModule());
     SmallString<0> PCM;
     if (!llvm::sys::path::is_absolute(Mod.getASTFile()))
@@ -3248,7 +3260,6 @@ llvm::DIType *CGDebugInfo::CreateTypeNode(QualType Ty, llvm::DIFile *Unit) {
   case Type::TypeOf:
   case Type::Decltype:
   case Type::UnaryTransform:
-  case Type::PackExpansion:
     break;
   }
 
@@ -4950,13 +4961,17 @@ void CGDebugInfo::finalize() {
   DBuilder.finalize();
 }
 
+// Don't ignore in case of explicit cast where it is referenced indirectly.
 void CGDebugInfo::EmitExplicitCastType(QualType Ty) {
-  if (!CGM.getCodeGenOpts().hasReducedDebugInfo())
-    return;
+  if (CGM.getCodeGenOpts().hasReducedDebugInfo())
+    if (auto *DieTy = getOrCreateType(Ty, TheCU->getFile()))
+      DBuilder.retainType(DieTy);
+}
 
-  if (auto *DieTy = getOrCreateType(Ty, TheCU->getFile()))
-    // Don't ignore in case of explicit cast where it is referenced indirectly.
-    DBuilder.retainType(DieTy);
+void CGDebugInfo::EmitAndRetainType(QualType Ty) {
+  if (CGM.getCodeGenOpts().hasMaybeUnusedDebugInfo())
+    if (auto *DieTy = getOrCreateType(Ty, TheCU->getFile()))
+      DBuilder.retainType(DieTy);
 }
 
 llvm::DebugLoc CGDebugInfo::SourceLocToDebugLoc(SourceLocation Loc) {

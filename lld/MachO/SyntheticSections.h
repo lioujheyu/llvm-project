@@ -13,6 +13,7 @@
 #include "ExportTrie.h"
 #include "InputSection.h"
 #include "OutputSection.h"
+#include "OutputSegment.h"
 #include "Target.h"
 
 #include "llvm/ADT/SetVector.h"
@@ -23,14 +24,15 @@ namespace macho {
 
 namespace section_names {
 
-constexpr const char *pageZero = "__pagezero";
-constexpr const char *header = "__mach_header";
-constexpr const char *binding = "__binding";
-constexpr const char *lazyBinding = "__lazy_binding";
-constexpr const char *export_ = "__export";
-constexpr const char *symbolTable = "__symbol_table";
-constexpr const char *stringTable = "__string_table";
-constexpr const char *got = "__got";
+constexpr const char pageZero[] = "__pagezero";
+constexpr const char header[] = "__mach_header";
+constexpr const char binding[] = "__binding";
+constexpr const char lazyBinding[] = "__lazy_binding";
+constexpr const char export_[] = "__export";
+constexpr const char symbolTable[] = "__symbol_table";
+constexpr const char stringTable[] = "__string_table";
+constexpr const char got[] = "__got";
+constexpr const char threadPtrs[] = "__thread_ptrs";
 
 } // namespace section_names
 
@@ -45,6 +47,29 @@ public:
   static bool classof(const OutputSection *sec) {
     return sec->kind() == SyntheticKind;
   }
+
+  const StringRef segname;
+};
+
+// All sections in __LINKEDIT should inherit from this.
+class LinkEditSection : public SyntheticSection {
+public:
+  LinkEditSection(const char *segname, const char *name)
+      : SyntheticSection(segname, name) {
+    align = WordSize;
+  }
+
+  virtual uint64_t getRawSize() const = 0;
+
+  // codesign (or more specifically libstuff) checks that each section in
+  // __LINKEDIT ends where the next one starts -- no gaps are permitted. We
+  // therefore align every section's start and end points to WordSize.
+  //
+  // NOTE: This assumes that the extra bytes required for alignment can be
+  // zero-valued bytes.
+  uint64_t getSize() const override final {
+    return llvm::alignTo(getRawSize(), WordSize);
+  }
 };
 
 // The header of the Mach-O file, which must have a file offset of zero.
@@ -53,7 +78,7 @@ public:
   MachHeaderSection();
   void addLoadCommand(LoadCommand *);
   bool isHidden() const override { return true; }
-  size_t getSize() const override;
+  uint64_t getSize() const override;
   void writeTo(uint8_t *buf) const override;
 
 private:
@@ -67,42 +92,66 @@ class PageZeroSection : public SyntheticSection {
 public:
   PageZeroSection();
   bool isHidden() const override { return true; }
-  size_t getSize() const override { return PageZeroSize; }
+  uint64_t getSize() const override { return PageZeroSize; }
   uint64_t getFileSize() const override { return 0; }
   void writeTo(uint8_t *buf) const override {}
 };
 
-// This section will be populated by dyld with addresses to non-lazily-loaded
-// dylib symbols.
-class GotSection : public SyntheticSection {
+// This is the base class for the GOT and TLVPointer sections, which are nearly
+// functionally identical -- they will both be populated by dyld with addresses
+// to non-lazily-loaded dylib symbols. The main difference is that the
+// TLVPointerSection stores references to thread-local variables.
+class NonLazyPointerSectionBase : public SyntheticSection {
 public:
-  GotSection();
+  NonLazyPointerSectionBase(const char *segname, const char *name);
 
-  const llvm::SetVector<const DylibSymbol *> &getEntries() const {
-    return entries;
-  }
+  const llvm::SetVector<const Symbol *> &getEntries() const { return entries; }
 
   bool isNeeded() const override { return !entries.empty(); }
 
-  size_t getSize() const override { return entries.size() * WordSize; }
+  uint64_t getSize() const override { return entries.size() * WordSize; }
 
-  void writeTo(uint8_t *buf) const override {
-    // Nothing to write, GOT contains all zeros at link time; it's populated at
-    // runtime by dyld.
-  }
+  void writeTo(uint8_t *buf) const override;
 
-  void addEntry(DylibSymbol &sym);
+  void addEntry(Symbol &sym);
 
 private:
-  llvm::SetVector<const DylibSymbol *> entries;
+  llvm::SetVector<const Symbol *> entries;
+};
+
+class GotSection : public NonLazyPointerSectionBase {
+public:
+  GotSection()
+      : NonLazyPointerSectionBase(segment_names::dataConst,
+                                  section_names::got) {
+    // TODO: section_64::reserved1 should be an index into the indirect symbol
+    // table, which we do not currently emit
+  }
+};
+
+class TlvPointerSection : public NonLazyPointerSectionBase {
+public:
+  TlvPointerSection()
+      : NonLazyPointerSectionBase(segment_names::data,
+                                  section_names::threadPtrs) {}
+};
+
+struct BindingEntry {
+  const DylibSymbol *dysym;
+  const InputSection *isec;
+  uint64_t offset;
+  int64_t addend;
+  BindingEntry(const DylibSymbol *dysym, const InputSection *isec,
+               uint64_t offset, int64_t addend)
+      : dysym(dysym), isec(isec), offset(offset), addend(addend) {}
 };
 
 // Stores bind opcodes for telling dyld which symbols to load non-lazily.
-class BindingSection : public SyntheticSection {
+class BindingSection : public LinkEditSection {
 public:
   BindingSection();
   void finalizeContents();
-  size_t getSize() const override { return contents.size(); }
+  uint64_t getRawSize() const override { return contents.size(); }
   // Like other sections in __LINKEDIT, the binding section is special: its
   // offsets are recorded in the LC_DYLD_INFO_ONLY load command, instead of in
   // section headers.
@@ -110,6 +159,13 @@ public:
   bool isNeeded() const override;
   void writeTo(uint8_t *buf) const override;
 
+  void addEntry(const DylibSymbol *dysym, const InputSection *isec,
+                uint64_t offset, int64_t addend) {
+    bindings.emplace_back(dysym, isec, offset, addend);
+  }
+
+private:
+  std::vector<BindingEntry> bindings;
   SmallVector<char, 128> contents;
 };
 
@@ -138,7 +194,7 @@ public:
 class StubsSection : public SyntheticSection {
 public:
   StubsSection();
-  size_t getSize() const override;
+  uint64_t getSize() const override;
   bool isNeeded() const override { return !entries.empty(); }
   void writeTo(uint8_t *buf) const override;
 
@@ -153,7 +209,7 @@ private:
 class StubHelperSection : public SyntheticSection {
 public:
   StubHelperSection();
-  size_t getSize() const override;
+  uint64_t getSize() const override;
   bool isNeeded() const override;
   void writeTo(uint8_t *buf) const override;
 
@@ -169,22 +225,22 @@ public:
 class ImageLoaderCacheSection : public InputSection {
 public:
   ImageLoaderCacheSection();
-  size_t getSize() const override { return WordSize; }
+  uint64_t getSize() const override { return WordSize; }
 };
 
 class LazyPointerSection : public SyntheticSection {
 public:
   LazyPointerSection();
-  size_t getSize() const override;
+  uint64_t getSize() const override;
   bool isNeeded() const override;
   void writeTo(uint8_t *buf) const override;
 };
 
-class LazyBindingSection : public SyntheticSection {
+class LazyBindingSection : public LinkEditSection {
 public:
   LazyBindingSection();
   void finalizeContents();
-  size_t getSize() const override { return contents.size(); }
+  uint64_t getRawSize() const override { return contents.size(); }
   uint32_t encode(const DylibSymbol &);
   // Like other sections in __LINKEDIT, the lazy binding section is special: its
   // offsets are recorded in the LC_DYLD_INFO_ONLY load command, instead of in
@@ -199,11 +255,11 @@ private:
 };
 
 // Stores a trie that describes the set of exported symbols.
-class ExportSection : public SyntheticSection {
+class ExportSection : public LinkEditSection {
 public:
   ExportSection();
   void finalizeContents();
-  size_t getSize() const override { return size; }
+  uint64_t getRawSize() const override { return size; }
   // Like other sections in __LINKEDIT, the export section is special: its
   // offsets are recorded in the LC_DYLD_INFO_ONLY load command, instead of in
   // section headers.
@@ -216,12 +272,12 @@ private:
 };
 
 // Stores the strings referenced by the symbol table.
-class StringTableSection : public SyntheticSection {
+class StringTableSection : public LinkEditSection {
 public:
   StringTableSection();
   // Returns the start offset of the added string.
   uint32_t addString(StringRef);
-  size_t getSize() const override { return size; }
+  uint64_t getRawSize() const override { return size; }
   // Like other sections in __LINKEDIT, the string table section is special: its
   // offsets are recorded in the LC_SYMTAB load command, instead of in section
   // headers.
@@ -246,7 +302,7 @@ public:
   SymtabSection(StringTableSection &);
   void finalizeContents();
   size_t getNumSymbols() const { return symbols.size(); }
-  size_t getSize() const override;
+  uint64_t getSize() const override;
   // Like other sections in __LINKEDIT, the symtab section is special: its
   // offsets are recorded in the LC_SYMTAB load command, instead of in section
   // headers.
@@ -259,7 +315,10 @@ private:
 };
 
 struct InStruct {
+  MachHeaderSection *header = nullptr;
+  BindingSection *binding = nullptr;
   GotSection *got = nullptr;
+  TlvPointerSection *tlvPointers = nullptr;
   LazyPointerSection *lazyPointers = nullptr;
   StubsSection *stubs = nullptr;
   StubHelperSection *stubHelper = nullptr;
@@ -267,6 +326,7 @@ struct InStruct {
 };
 
 extern InStruct in;
+extern std::vector<SyntheticSection *> syntheticSections;
 
 } // namespace macho
 } // namespace lld

@@ -443,9 +443,11 @@ public:
 
   /// This static method is the primary way to construct an VectorType.
   static VectorType *get(Type *ElementType, ElementCount EC);
+
   static VectorType *get(Type *ElementType, unsigned NumElements,
-                         bool Scalable = false) {
-    return VectorType::get(ElementType, {NumElements, Scalable});
+                         bool Scalable) {
+    return VectorType::get(ElementType,
+                           ElementCount::get(NumElements, Scalable));
   }
 
   static VectorType *get(Type *ElementType, const VectorType *Other) {
@@ -536,8 +538,6 @@ public:
            T->getTypeID() == ScalableVectorTyID;
   }
 };
-
-bool Type::isVectorTy() const { return isa<VectorType>(this); }
 
 /// Class to represent fixed width SIMD vectors
 class FixedVectorType : public VectorType {
@@ -641,7 +641,7 @@ public:
 };
 
 inline ElementCount VectorType::getElementCount() const {
-  return ElementCount(ElementQuantity, isa<ScalableVectorType>(this));
+  return ElementCount::get(ElementQuantity, isa<ScalableVectorType>(this));
 }
 
 /// Class to represent pointers.
@@ -703,12 +703,6 @@ Type *Type::getWithNewBitWidth(unsigned NewBitWidth) const {
 
 unsigned Type::getPointerAddressSpace() const {
   return cast<PointerType>(getScalarType())->getAddressSpace();
-}
-
-Type *Type::getScalarType() const {
-  if (isVectorTy())
-    return cast<VectorType>(this)->getElementType();
-  return const_cast<Type *>(this);
 }
 
 } // end namespace llvm

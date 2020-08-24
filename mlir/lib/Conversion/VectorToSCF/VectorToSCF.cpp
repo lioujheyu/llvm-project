@@ -16,6 +16,7 @@
 
 #include "../PassDetail.h"
 #include "mlir/Dialect/Affine/EDSC/Intrinsics.h"
+#include "mlir/Dialect/Linalg/Utils/Utils.h"
 #include "mlir/Dialect/SCF/EDSC/Builders.h"
 #include "mlir/Dialect/SCF/EDSC/Intrinsics.h"
 #include "mlir/Dialect/StandardOps/EDSC/Intrinsics.h"
@@ -86,10 +87,10 @@ public:
         scope(std::make_unique<ScopedContext>(rewriter, loc)), xferOp(xferOp),
         op(xferOp.getOperation()) {
     vectorType = xferOp.getVectorType();
-    // TODO(ntv, ajcbik): when we go to k > 1-D vectors adapt minorRank.
+    // TODO: when we go to k > 1-D vectors adapt minorRank.
     minorRank = 1;
     majorRank = vectorType.getRank() - minorRank;
-    leadingRank = xferOp.getMemRefType().getRank() - (majorRank + minorRank);
+    leadingRank = xferOp.getLeadingMemRefRank();
     majorVectorType =
         VectorType::get(vectorType.getShape().take_front(majorRank),
                         vectorType.getElementType());
@@ -164,14 +165,35 @@ void NDTransferOpHelper<ConcreteOp>::emitLoops(Lambda loopBodyBuilder) {
     auto majorLbs = vectorBoundsCapture.getLbs();
     auto majorUbs = vectorBoundsCapture.getUbs();
     auto majorSteps = vectorBoundsCapture.getSteps();
-    SmallVector<Value, 8> majorIvs(vectorBoundsCapture.rank());
-    AffineLoopNestBuilder(majorIvs, majorLbs, majorUbs, majorSteps)([&] {
-      ValueRange indices(xferOp.indices());
-      loopBodyBuilder(majorIvs, indices.take_front(leadingRank),
-                      indices.drop_front(leadingRank).take_front(majorRank),
-                      indices.take_back(minorRank), memrefBoundsCapture);
-    });
+    affineLoopNestBuilder(
+        majorLbs, majorUbs, majorSteps, [&](ValueRange majorIvs) {
+          ValueRange indices(xferOp.indices());
+          loopBodyBuilder(majorIvs, indices.take_front(leadingRank),
+                          indices.drop_front(leadingRank).take_front(majorRank),
+                          indices.take_back(minorRank), memrefBoundsCapture);
+        });
   }
+}
+
+static Optional<int64_t> extractConstantIndex(Value v) {
+  if (auto cstOp = v.getDefiningOp<ConstantIndexOp>())
+    return cstOp.getValue();
+  if (auto affineApplyOp = v.getDefiningOp<AffineApplyOp>())
+    if (affineApplyOp.getAffineMap().isSingleConstant())
+      return affineApplyOp.getAffineMap().getSingleConstantResult();
+  return None;
+}
+
+// Missing foldings of scf.if make it necessary to perform poor man's folding
+// eagerly, especially in the case of unrolling. In the future, this should go
+// away once scf.if folds properly.
+static Value onTheFlyFoldSLT(Value v, Value ub) {
+  using namespace mlir::edsc::op;
+  auto maybeCstV = extractConstantIndex(v);
+  auto maybeCstUb = extractConstantIndex(ub);
+  if (maybeCstV && maybeCstUb && *maybeCstV < *maybeCstUb)
+    return Value();
+  return slt(v, ub);
 }
 
 template <typename ConcreteOp>
@@ -182,14 +204,19 @@ Value NDTransferOpHelper<ConcreteOp>::emitInBoundsCondition(
   Value inBoundsCondition;
   majorIvsPlusOffsets.reserve(majorIvs.size());
   unsigned idx = 0;
-  for (auto it : llvm::zip(majorIvs, majorOffsets, memrefBounds.getUbs())) {
+  SmallVector<Value, 4> bounds =
+      linalg::applyMapToValues(rewriter, xferOp.getLoc(),
+                               xferOp.permutation_map(), memrefBounds.getUbs());
+  for (auto it : llvm::zip(majorIvs, majorOffsets, bounds)) {
     Value iv = std::get<0>(it), off = std::get<1>(it), ub = std::get<2>(it);
     using namespace mlir::edsc::op;
     majorIvsPlusOffsets.push_back(iv + off);
     if (xferOp.isMaskedDim(leadingRank + idx)) {
-      Value inBounds = majorIvsPlusOffsets.back() < ub;
-      inBoundsCondition =
-          (inBoundsCondition) ? (inBoundsCondition && inBounds) : inBounds;
+      Value inBoundsCond = onTheFlyFoldSLT(majorIvsPlusOffsets.back(), ub);
+      if (inBoundsCond)
+        inBoundsCondition = (inBoundsCondition)
+                                ? (inBoundsCondition && inBoundsCond)
+                                : inBoundsCond;
     }
     ++idx;
   }
@@ -201,7 +228,10 @@ static Value setAllocAtFunctionEntry(MemRefType memRefMinorVectorType,
                                      Operation *op) {
   auto &b = ScopedContext::getBuilderRef();
   OpBuilder::InsertionGuard guard(b);
-  b.setInsertionPointToStart(&op->getParentOfType<FuncOp>().front());
+  Operation *scope =
+      op->getParentWithTrait<OpTrait::AutomaticAllocationScope>();
+  assert(scope && "Expected op to be inside automatic allocation scope");
+  b.setInsertionPointToStart(&scope->getRegion(0).front());
   Value res =
       std_alloca(memRefMinorVectorType, ValueRange{}, b.getI64IntegerAttr(128));
   return res;
@@ -226,12 +256,12 @@ LogicalResult NDTransferOpHelper<TransferReadOp>::doReplace() {
       indexing.append(majorIvsPlusOffsets.begin(), majorIvsPlusOffsets.end());
       indexing.append(minorOffsets.begin(), minorOffsets.end());
       Value memref = xferOp.memref();
-      auto map = TransferReadOp::getTransferMinorIdentityMap(
-          xferOp.getMemRefType(), minorVectorType);
+      auto map =
+          getTransferMinorIdentityMap(xferOp.getMemRefType(), minorVectorType);
       ArrayAttr masked;
-      if (xferOp.isMaskedDim(xferOp.getVectorType().getRank() - 1)) {
+      if (!xferOp.isMaskedDim(xferOp.getVectorType().getRank() - 1)) {
         OpBuilder &b = ScopedContext::getBuilderRef();
-        masked = b.getBoolArrayAttr({true});
+        masked = b.getBoolArrayAttr({false});
       }
       return vector_transfer_read(minorVectorType, memref, indexing,
                                   AffineMapAttr::get(map), xferOp.padding(),
@@ -330,12 +360,12 @@ LogicalResult NDTransferOpHelper<TransferWriteOp>::doReplace() {
         result = vector_extract(xferOp.vector(), majorIvs);
       else
         result = std_load(alloc, majorIvs);
-      auto map = TransferWriteOp::getTransferMinorIdentityMap(
-          xferOp.getMemRefType(), minorVectorType);
+      auto map =
+          getTransferMinorIdentityMap(xferOp.getMemRefType(), minorVectorType);
       ArrayAttr masked;
-      if (xferOp.isMaskedDim(xferOp.getVectorType().getRank() - 1)) {
+      if (!xferOp.isMaskedDim(xferOp.getVectorType().getRank() - 1)) {
         OpBuilder &b = ScopedContext::getBuilderRef();
-        masked = b.getBoolArrayAttr({true});
+        masked = b.getBoolArrayAttr({false});
       }
       vector_transfer_write(result, xferOp.memref(), indexing,
                             AffineMapAttr::get(map), masked);
@@ -433,16 +463,16 @@ clip(TransferOpTy transfer, MemRefBoundsCapture &bounds, ArrayRef<Value> ivs) {
     auto i = memRefAccess[memRefDim];
     if (loopIndex < 0) {
       auto N_minus_1 = N - one;
-      auto select_1 = std_select(i < N, i, N_minus_1);
+      auto select_1 = std_select(slt(i, N), i, N_minus_1);
       clippedScalarAccessExprs[memRefDim] =
-          std_select(i < zero, zero, select_1);
+          std_select(slt(i, zero), zero, select_1);
     } else {
       auto ii = ivs[loopIndex];
       auto i_plus_ii = i + ii;
       auto N_minus_1 = N - one;
-      auto select_1 = std_select(i_plus_ii < N, i_plus_ii, N_minus_1);
+      auto select_1 = std_select(slt(i_plus_ii, N), i_plus_ii, N_minus_1);
       clippedScalarAccessExprs[memRefDim] =
-          std_select(i_plus_ii < zero, zero, select_1);
+          std_select(slt(i_plus_ii, zero), zero, select_1);
     }
   }
 
@@ -505,8 +535,8 @@ MemRefType VectorTransferRewriter<TransferOpTy>::tmpMemRefType(
 /// in the presence of data-parallel only operations, we generate code that
 /// writes the same value multiple time on the edge locations.
 ///
-/// TODO(ntv): implement alternatives to clipping.
-/// TODO(ntv): support non-data-parallel operations.
+/// TODO: implement alternatives to clipping.
+/// TODO: support non-data-parallel operations.
 
 /// Performs the rewrite.
 template <>
@@ -515,7 +545,7 @@ LogicalResult VectorTransferRewriter<TransferReadOp>::matchAndRewrite(
   using namespace mlir::edsc::op;
 
   TransferReadOp transfer = cast<TransferReadOp>(op);
-  if (AffineMap::isMinorIdentity(transfer.permutation_map())) {
+  if (transfer.permutation_map().isMinorIdentity()) {
     // If > 1D, emit a bunch of loops around 1-D vector transfers.
     if (transfer.getVectorType().getRank() > 1)
       return NDTransferOpHelper<TransferReadOp>(rewriter, transfer, options)
@@ -580,15 +610,15 @@ LogicalResult VectorTransferRewriter<TransferReadOp>::matchAndRewrite(
 /// See `Important notes about clipping and full-tiles only abstraction` in the
 /// description of `readClipped` above.
 ///
-/// TODO(ntv): implement alternatives to clipping.
-/// TODO(ntv): support non-data-parallel operations.
+/// TODO: implement alternatives to clipping.
+/// TODO: support non-data-parallel operations.
 template <>
 LogicalResult VectorTransferRewriter<TransferWriteOp>::matchAndRewrite(
     Operation *op, PatternRewriter &rewriter) const {
   using namespace edsc::op;
 
   TransferWriteOp transfer = cast<TransferWriteOp>(op);
-  if (AffineMap::isMinorIdentity(transfer.permutation_map())) {
+  if (transfer.permutation_map().isMinorIdentity()) {
     // If > 1D, emit a bunch of loops around 1-D vector transfers.
     if (transfer.getVectorType().getRank() > 1)
       return NDTransferOpHelper<TransferWriteOp>(rewriter, transfer, options)
@@ -651,7 +681,6 @@ namespace {
 struct ConvertVectorToSCFPass
     : public ConvertVectorToSCFBase<ConvertVectorToSCFPass> {
   ConvertVectorToSCFPass() = default;
-  ConvertVectorToSCFPass(const ConvertVectorToSCFPass &pass) {}
   ConvertVectorToSCFPass(const VectorTransferToSCFOptions &options) {
     this->fullUnroll = options.unroll;
   }

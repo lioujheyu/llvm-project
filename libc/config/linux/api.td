@@ -86,6 +86,25 @@ def AssertAPI : PublicAPI<"assert.h"> {
   ];
 }
 
+def CTypeAPI : PublicAPI<"ctype.h"> {
+  let Functions = [
+    "isalnum",
+    "isalpha",
+    "isblank",
+    "iscntrl",
+    "isdigit",
+    "isgraph",
+    "islower",
+    "isprint",
+    "ispunct",
+    "isspace",
+    "isupper",
+    "isxdigit",
+    "tolower",
+    "toupper",
+  ];
+}
+
 def MathErrHandlingMacro : MacroDef<"math_errhandling"> {
   let Defn = [{
     #ifndef math_errhandling
@@ -150,48 +169,75 @@ def MathAPI : PublicAPI<"math.h"> {
     FloatT,
   ];
   let Functions = [
+   "copysign",
+   "copysignf",
+   "copysignl",
    "ceil",
    "ceilf",
+   "ceill",
    "cosf",
    "fabs",
    "fabsf",
+   "fabsl",
    "floor",
    "floorf",
+   "floorl",
+   "fmax",
+   "fmaxf",
+   "fmaxl",
+   "fmin",
+   "fminf",
+   "fminl",
+   "frexp",
+   "frexpf",
+   "frexpl",
+   "logb",
+   "logbf",
+   "logbl",
+   "modf",
+   "modff",
+   "modfl",
    "expf",
    "exp2f",
    "round",
+   "roundf",
+   "roundl",
    "sincosf",
    "sinf",
    "trunc",
    "truncf",
+   "truncl",
   ];
 }
 
 def StringAPI : PublicAPI<"string.h"> {
   let Functions = [
     "bzero",
+    "memchr",
+    "memcmp",
     "memcpy",
     "memmove",
-    "memcmp",
-    "memchr",
+    "memrchr",
     "memset",
-    "strcpy",
-    "strncpy",
     "strcat",
-    "strncat",
+    "strchr",
     "strcmp",
     "strcoll",
+    "strcpy",
+    "strcspn",  
+    "strerror",
+    "strlen",
+    "strncat",
     "strncmp",
-    "strxfrm",
-    "strchr",
-    "strcspn",
+    "strncpy",
+    "strnlen",
     "strpbrk",
     "strrchr",
     "strspn",
     "strstr",
     "strtok",
-    "strerror",
-    "strlen",
+    "strtok_r",
+    "strxfrm",   
   ];
 
   let TypeDeclarations = [

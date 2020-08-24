@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "llvm/Analysis/InlineCost.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/IR/PassManager.h"
 
 namespace llvm {
@@ -48,6 +49,9 @@ class InlineAdvisor;
 /// obligations.
 class InlineAdvice {
 public:
+  InlineAdvice(InlineAdvisor *Advisor, CallBase &CB,
+               OptimizationRemarkEmitter &ORE, bool IsInliningRecommended);
+
   InlineAdvice(InlineAdvice &&) = delete;
   InlineAdvice(const InlineAdvice &) = delete;
   virtual ~InlineAdvice() {
@@ -81,11 +85,10 @@ public:
 
   /// Get the inlining recommendation.
   bool isInliningRecommended() const { return IsInliningRecommended; }
+  const DebugLoc &getOriginalCallSiteDebugLoc() const { return DLoc; }
+  const BasicBlock *getOriginalCallSiteBasicBlock() const { return Block; }
 
 protected:
-  InlineAdvice(InlineAdvisor *Advisor, CallBase &CB,
-               bool IsInliningRecommended);
-
   virtual void recordInliningImpl() {}
   virtual void recordInliningWithCalleeDeletedImpl() {}
   virtual void recordUnsuccessfulInliningImpl(const InlineResult &Result) {}
@@ -95,6 +98,13 @@ protected:
   /// Caller and Callee are pre-inlining.
   Function *const Caller;
   Function *const Callee;
+
+  // Capture the context of CB before inlining, as a successful inlining may
+  // change that context, and we want to report success or failure in the
+  // original context.
+  const DebugLoc DLoc;
+  const BasicBlock *const Block;
+  OptimizationRemarkEmitter &ORE;
   const bool IsInliningRecommended;
 
 private:
@@ -142,14 +152,14 @@ protected:
   /// after each SCC inlining (e.g. argument promotion does that).
   void freeDeletedFunctions();
 
-  bool isFunctionDeleted(Function *F) const {
+  bool isFunctionDeleted(const Function *F) const {
     return DeletedFunctions.count(F);
   }
 
 private:
   friend class InlineAdvice;
   void markFunctionAsDeleted(Function *F);
-  std::unordered_set<Function *> DeletedFunctions;
+  std::unordered_set<const Function *> DeletedFunctions;
 };
 
 /// The default (manual heuristics) implementation of the InlineAdvisor. This
@@ -194,6 +204,17 @@ public:
   Result run(Module &M, ModuleAnalysisManager &MAM) { return Result(M, MAM); }
 };
 
+#ifdef LLVM_HAVE_TF_AOT
+std::unique_ptr<InlineAdvisor>
+getReleaseModeAdvisor(Module &M, ModuleAnalysisManager &MAM);
+#endif
+
+#ifdef LLVM_HAVE_TF_API
+std::unique_ptr<InlineAdvisor>
+getDevelopmentModeAdvisor(Module &M, ModuleAnalysisManager &MAM,
+                          std::function<bool(CallBase &)> GetDefaultAdvice);
+#endif
+
 // Default (manual policy) decision making helper APIs. Shared with the legacy
 // pass manager inliner.
 
@@ -208,7 +229,15 @@ shouldInline(CallBase &CB, function_ref<InlineCost(CallBase &CB)> GetInlineCost,
 /// Emit ORE message.
 void emitInlinedInto(OptimizationRemarkEmitter &ORE, DebugLoc DLoc,
                      const BasicBlock *Block, const Function &Callee,
-                     const Function &Caller, const InlineCost &IC);
+                     const Function &Caller, const InlineCost &IC,
+                     bool ForProfileContext = false,
+                     const char *PassName = nullptr);
+
+/// get call site location as string
+std::string getCallSiteLocation(DebugLoc DLoc);
+
+/// Add location info to ORE message.
+void addLocationToRemarks(OptimizationRemark &Remark, DebugLoc DLoc);
 
 /// Set the inline-remark attribute.
 void setInlineRemark(CallBase &CB, StringRef Message);

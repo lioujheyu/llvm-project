@@ -602,11 +602,11 @@ void ExprEngine::handleConstructor(const Expr *E,
                                             *Call, *this);
 
   ExplodedNodeSet DstEvaluated;
-  StmtNodeBuilder Bldr(DstPreCall, DstEvaluated, *currBldrCtx);
 
   if (CE && CE->getConstructor()->isTrivial() &&
       CE->getConstructor()->isCopyOrMoveConstructor() &&
       !CallOpts.IsArrayCtorOrDtor) {
+    StmtNodeBuilder Bldr(DstPreCall, DstEvaluated, *currBldrCtx);
     // FIXME: Handle other kinds of trivial constructors as well.
     for (ExplodedNodeSet::iterator I = DstPreCall.begin(), E = DstPreCall.end();
          I != E; ++I)
@@ -615,7 +615,8 @@ void ExprEngine::handleConstructor(const Expr *E,
   } else {
     for (ExplodedNodeSet::iterator I = DstPreCall.begin(), E = DstPreCall.end();
          I != E; ++I)
-      defaultEvalCall(Bldr, *I, *Call, CallOpts);
+      getCheckerManager().runCheckersForEvalCall(DstEvaluated, *I, *Call, *this,
+                                                 CallOpts);
   }
 
   // If the CFG was constructed without elements for temporary destructors
@@ -625,6 +626,8 @@ void ExprEngine::handleConstructor(const Expr *E,
   // in the CFG, would be called at the end of the full expression or
   // later (for life-time extended temporaries) -- but avoids infeasible
   // paths when no-return temporary destructors are used for assertions.
+  ExplodedNodeSet DstEvaluatedPostProcessed;
+  StmtNodeBuilder Bldr(DstEvaluated, DstEvaluatedPostProcessed, *currBldrCtx);
   const AnalysisDeclContext *ADC = LCtx->getAnalysisDeclContext();
   if (!ADC->getCFGBuildOptions().AddTemporaryDtors) {
     if (llvm::isa_and_nonnull<CXXTempObjectRegion>(TargetRegion) &&
@@ -654,7 +657,7 @@ void ExprEngine::handleConstructor(const Expr *E,
   }
 
   ExplodedNodeSet DstPostArgumentCleanup;
-  for (ExplodedNode *I : DstEvaluated)
+  for (ExplodedNode *I : DstEvaluatedPostProcessed)
     finishArgumentConstruction(DstPostArgumentCleanup, I, *Call);
 
   // If there were other constructors called for object-type arguments

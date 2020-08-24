@@ -242,9 +242,9 @@ std::optional<Expr<SomeType>> MixedComplexLeft(
     // (a,b) * x -> (a*x, b*x)
     // (a,b) / x -> (a/x, b/x)
     auto copy{iry};
-    auto rr{NumericOperation<Multiply>(messages, AsGenericExpr(std::move(zr)),
+    auto rr{NumericOperation<OPR>(messages, AsGenericExpr(std::move(zr)),
         AsGenericExpr(std::move(iry)), defaultRealKind)};
-    auto ri{NumericOperation<Multiply>(messages, AsGenericExpr(std::move(zi)),
+    auto ri{NumericOperation<OPR>(messages, AsGenericExpr(std::move(zi)),
         AsGenericExpr(std::move(copy)), defaultRealKind)};
     if (auto parts{common::AllPresent(std::move(rr), std::move(ri))}) {
       return Package(ConstructComplex(messages, std::get<0>(std::move(*parts)),
@@ -287,7 +287,7 @@ std::optional<Expr<SomeType>> MixedComplexRight(
       std::is_same_v<OPR<LargestReal>, Multiply<LargestReal>>) {
     // x + (a,b) -> (a,b) + x -> (a+x, b)
     // x * (a,b) -> (a,b) * x -> (a*x, b*x)
-    return MixedComplexLeft<Add, LCAT>(
+    return MixedComplexLeft<OPR, LCAT>(
         messages, std::move(zy), std::move(irx), defaultRealKind);
   } else if constexpr (std::is_same_v<OPR<LargestReal>,
                            Subtract<LargestReal>>) {
@@ -703,6 +703,10 @@ bool IsAssumedRank(const ActualArgument &arg) {
 bool IsProcedure(const Expr<SomeType> &expr) {
   return std::holds_alternative<ProcedureDesignator>(expr.u);
 }
+bool IsFunction(const Expr<SomeType> &expr) {
+  const auto *designator{std::get_if<ProcedureDesignator>(&expr.u)};
+  return designator && designator->GetType().has_value();
+}
 
 bool IsProcedurePointer(const Expr<SomeType> &expr) {
   return std::visit(common::visitors{
@@ -981,28 +985,39 @@ bool IsProcedurePointer(const Symbol &symbol) {
   return symbol.has<ProcEntityDetails>() && IsPointer(symbol);
 }
 
-bool IsSaved(const Symbol &symbol) {
-  auto scopeKind{symbol.owner().kind()};
-  if (scopeKind == Scope::Kind::Module || scopeKind == Scope::Kind::BlockData) {
-    return true;
-  } else if (scopeKind == Scope::Kind::DerivedType) {
-    return false; // this is a component
-  } else if (IsNamedConstant(symbol)) {
-    return false;
-  } else if (symbol.attrs().test(Attr::SAVE)) {
-    return true;
-  } else if (const auto *object{symbol.detailsIf<ObjectEntityDetails>()};
-             object && object->init()) {
-    return true;
-  } else if (IsProcedurePointer(symbol) &&
-      symbol.get<ProcEntityDetails>().init()) {
-    return true;
-  } else if (const Symbol * block{FindCommonBlockContaining(symbol)};
-             block && block->attrs().test(Attr::SAVE)) {
-    return true;
-  } else {
-    return false;
+bool IsSaved(const Symbol &original) {
+  if (const Symbol * root{GetAssociationRoot(original)}) {
+    const Symbol &symbol{*root};
+    const Scope *scope{&symbol.owner()};
+    auto scopeKind{scope->kind()};
+    if (scopeKind == Scope::Kind::Module) {
+      return true; // BLOCK DATA entities must all be in COMMON, handled below
+    } else if (symbol.attrs().test(Attr::SAVE)) {
+      return true;
+    } else if (scopeKind == Scope::Kind::DerivedType) {
+      return false; // this is a component
+    } else if (IsNamedConstant(symbol)) {
+      return false;
+    } else if (const auto *object{symbol.detailsIf<ObjectEntityDetails>()};
+               object && object->init()) {
+      return true;
+    } else if (IsProcedurePointer(symbol) &&
+        symbol.get<ProcEntityDetails>().init()) {
+      return true;
+    } else if (const Symbol * block{FindCommonBlockContaining(symbol)};
+               block && block->attrs().test(Attr::SAVE)) {
+      return true;
+    } else if (IsDummy(symbol) || IsFunctionResult(symbol)) {
+      return false;
+    } else {
+      for (; !scope->IsGlobal(); scope = &scope->parent()) {
+        if (scope->hasSAVE()) {
+          return true;
+        }
+      }
+    }
   }
+  return false;
 }
 
 bool IsDummy(const Symbol &symbol) {
@@ -1015,9 +1030,29 @@ bool IsDummy(const Symbol &symbol) {
       symbol.details());
 }
 
+bool IsFunctionResult(const Symbol &symbol) {
+  return (symbol.has<ObjectEntityDetails>() &&
+             symbol.get<ObjectEntityDetails>().isFuncResult()) ||
+      (symbol.has<ProcEntityDetails>() &&
+          symbol.get<ProcEntityDetails>().isFuncResult());
+}
+
 int CountLenParameters(const DerivedTypeSpec &type) {
   return std::count_if(type.parameters().begin(), type.parameters().end(),
       [](const auto &pair) { return pair.second.isLen(); });
+}
+
+int CountNonConstantLenParameters(const DerivedTypeSpec &type) {
+  return std::count_if(
+      type.parameters().begin(), type.parameters().end(), [](const auto &pair) {
+        if (!pair.second.isLen()) {
+          return false;
+        } else if (const auto &expr{pair.second.GetExplicit()}) {
+          return !IsConstantExpr(*expr);
+        } else {
+          return true;
+        }
+      });
 }
 
 const Symbol &GetUsedModule(const UseDetails &details) {

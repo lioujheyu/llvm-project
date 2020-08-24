@@ -1324,12 +1324,19 @@ bool FastISel::selectCall(const User *I) {
       ExtraInfo |= InlineAsm::Extra_HasSideEffects;
     if (IA->isAlignStack())
       ExtraInfo |= InlineAsm::Extra_IsAlignStack;
+    if (Call->isConvergent())
+      ExtraInfo |= InlineAsm::Extra_IsConvergent;
     ExtraInfo |= IA->getDialect() * InlineAsm::Extra_AsmDialect;
 
-    BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc,
-            TII.get(TargetOpcode::INLINEASM))
-        .addExternalSymbol(IA->getAsmString().c_str())
-        .addImm(ExtraInfo);
+    MachineInstrBuilder MIB = BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc,
+                                      TII.get(TargetOpcode::INLINEASM));
+    MIB.addExternalSymbol(IA->getAsmString().c_str());
+    MIB.addImm(ExtraInfo);
+
+    const MDNode *SrcLoc = Call->getMetadata("srcloc");
+    if (SrcLoc)
+      MIB.addMetadata(SrcLoc);
+
     return true;
   }
 
@@ -1838,13 +1845,8 @@ bool FastISel::selectOperator(const User *I, unsigned Opcode) {
     return selectBinaryOp(I, ISD::FADD);
   case Instruction::Sub:
     return selectBinaryOp(I, ISD::SUB);
-  case Instruction::FSub: {
-    // FNeg is currently represented in LLVM IR as a special case of FSub.
-    Value *X;
-    if (match(I, m_FNeg(m_Value(X))))
-       return selectFNeg(I, X);
+  case Instruction::FSub:
     return selectBinaryOp(I, ISD::FSUB);
-  }
   case Instruction::Mul:
     return selectBinaryOp(I, ISD::MUL);
   case Instruction::FMul:

@@ -122,6 +122,12 @@ struct LinalgPromotionOptions {
     alignment = align;
     return *this;
   }
+  /// Use alloca with the default allocation scheme.
+  bool useAlloca = false;
+  LinalgPromotionOptions &setUseAlloca(bool use) {
+    useAlloca = use;
+    return *this;
+  }
   /// Callback function to do the allocation of the promoted buffer. If None,
   /// then the default allocation scheme of allocating a memref<?xi8> buffer
   /// followed by a view operation is used.
@@ -134,7 +140,6 @@ struct LinalgPromotionOptions {
     deallocationFn = deallocFn;
     return *this;
   }
-
   /// Callback function to do the copy of data to and from the promoted
   /// subview. If None then a linalg.copy is used.
   Optional<CopyCallbackFn> copyInFn = None;
@@ -165,19 +170,16 @@ Optional<LinalgOp> promoteSubViews(OpBuilder &b, LinalgOp op,
 void vectorizeLinalgOp(OpBuilder &builder, Operation *op);
 
 /// Emits a loop nest of `LoopTy` with the proper body for `op`.
-template <typename LoopTy, typename ConcreteOp>
+template <typename LoopTy>
 Optional<LinalgLoops> linalgLowerOpToLoops(OpBuilder &builder, Operation *op);
 
 /// Emits a loop nest of `scf.for` with the proper body for `op`.
-template <typename ConcreteOp>
 LogicalResult linalgOpToLoops(OpBuilder &builder, Operation *op);
 
 /// Emits a loop nest of `scf.parallel` with the proper body for `op`.
-template <typename ConcreteOp>
 LogicalResult linalgOpToParallelLoops(OpBuilder &builder, Operation *op);
 
 /// Emits a loop nest of `affine.for` with the proper body for `op`.
-template <typename ConcreteOp>
 LogicalResult linalgOpToAffineLoops(OpBuilder &builder, Operation *op);
 
 //===----------------------------------------------------------------------===//
@@ -266,6 +268,15 @@ struct LinalgTilingOptions {
   LinalgTilingLoopType loopType{LinalgTilingLoopType::Loops};
   LinalgTilingOptions &setLoopType(LinalgTilingLoopType lt) {
     loopType = lt;
+    return *this;
+  }
+
+  /// When specified, specifies distribution of generated tile loops to
+  /// processors.
+  Optional<LinalgLoopDistributionOptions> distribution = None;
+  LinalgTilingOptions &
+  setDistributionOptions(LinalgLoopDistributionOptions &distributionOptions) {
+    distribution = distributionOptions;
     return *this;
   }
 };
@@ -419,12 +430,12 @@ template <typename OpTy> struct LinalgLoweringPattern : public RewritePattern {
       // TODO: Move lowering to library calls here.
       return failure();
     } else if (loweringType == LinalgLoweringType::Loops) {
-      if (failed(linalgOpToLoops<OpTy>(rewriter, op)))
+      if (failed(linalgOpToLoops(rewriter, op)))
         return failure();
     } else if (loweringType == LinalgLoweringType::AffineLoops) {
-      if (failed(linalgOpToAffineLoops<OpTy>(rewriter, op)))
+      if (failed(linalgOpToAffineLoops(rewriter, op)))
         return failure();
-    } else if (failed(linalgOpToParallelLoops<OpTy>(rewriter, op))) {
+    } else if (failed(linalgOpToParallelLoops(rewriter, op))) {
       return failure();
     }
     rewriter.eraseOp(op);
@@ -500,6 +511,26 @@ struct LinalgCopyVTWForwardingPattern
                                 PatternRewriter &rewriter) const override;
 };
 
+/// Canonicalize AffineMinOp operations in the context of enclosing scf.for and
+/// scf.parallel by:
+///   1. building an affine map where uses of the induction variable of a loop
+///   are replaced by either the min (i.e. `%lb`) of the max
+///   (i.e. `%lb + %step * floordiv(%ub -1 - %lb, %step)`) expression, depending
+///   on whether the induction variable is used with a positive or negative
+///   coefficient.
+///   2. checking whether any of the results of this affine map is known to be
+///   greater than all other results.
+///   3. replacing the AffineMinOp by the result of (2).
+// TODO: move to a more appropriate place when it is determined. For now Linalg
+// depends both on Affine and SCF but they do not depend on each other.
+struct AffineMinSCFCanonicalizationPattern
+    : public OpRewritePattern<AffineMinOp> {
+  using OpRewritePattern<AffineMinOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(AffineMinOp minOp,
+                                PatternRewriter &rewriter) const override;
+};
+
 //===----------------------------------------------------------------------===//
 // Support for staged pattern application.
 //===----------------------------------------------------------------------===//
@@ -517,6 +548,7 @@ LogicalResult applyStagedPatterns(
     Operation *op, ArrayRef<OwningRewritePatternList> stage1Patterns,
     const OwningRewritePatternList &stage2Patterns,
     function_ref<LogicalResult(Operation *)> stage3Lambda = nullptr);
+
 } // namespace linalg
 } // namespace mlir
 

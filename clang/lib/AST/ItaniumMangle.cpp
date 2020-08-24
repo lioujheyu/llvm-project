@@ -160,6 +160,7 @@ public:
   void mangleDynamicInitializer(const VarDecl *D, raw_ostream &Out) override;
   void mangleDynamicAtExitDestructor(const VarDecl *D,
                                      raw_ostream &Out) override;
+  void mangleDynamicStermFinalizer(const VarDecl *D, raw_ostream &Out) override;
   void mangleSEHFilterExpression(const NamedDecl *EnclosingDecl,
                                  raw_ostream &Out) override;
   void mangleSEHFinallyBlock(const NamedDecl *EnclosingDecl,
@@ -656,6 +657,8 @@ void CXXNameMangler::mangle(GlobalDecl GD) {
     mangleName(FD);
   else if (const MSGuidDecl *GuidD = dyn_cast<MSGuidDecl>(GD.getDecl()))
     mangleName(GuidD);
+  else if (const BindingDecl *BD = dyn_cast<BindingDecl>(GD.getDecl()))
+    mangleName(BD);
   else
     llvm_unreachable("unexpected kind of global decl");
 }
@@ -2387,16 +2390,39 @@ void CXXNameMangler::mangleQualifiers(Qualifiers Quals, const DependentAddressSp
       switch (AS) {
       default: llvm_unreachable("Not a language specific address space");
       //  <OpenCL-addrspace> ::= "CL" [ "global" | "local" | "constant" |
-      //                                "private"| "generic" ]
-      case LangAS::opencl_global:   ASString = "CLglobal";   break;
-      case LangAS::opencl_local:    ASString = "CLlocal";    break;
-      case LangAS::opencl_constant: ASString = "CLconstant"; break;
-      case LangAS::opencl_private:  ASString = "CLprivate";  break;
-      case LangAS::opencl_generic:  ASString = "CLgeneric";  break;
+      //                                "private"| "generic" | "device" |
+      //                                "host" ]
+      case LangAS::opencl_global:
+        ASString = "CLglobal";
+        break;
+      case LangAS::opencl_global_device:
+        ASString = "CLdevice";
+        break;
+      case LangAS::opencl_global_host:
+        ASString = "CLhost";
+        break;
+      case LangAS::opencl_local:
+        ASString = "CLlocal";
+        break;
+      case LangAS::opencl_constant:
+        ASString = "CLconstant";
+        break;
+      case LangAS::opencl_private:
+        ASString = "CLprivate";
+        break;
+      case LangAS::opencl_generic:
+        ASString = "CLgeneric";
+        break;
       //  <CUDA-addrspace> ::= "CU" [ "device" | "constant" | "shared" ]
-      case LangAS::cuda_device:     ASString = "CUdevice";   break;
-      case LangAS::cuda_constant:   ASString = "CUconstant"; break;
-      case LangAS::cuda_shared:     ASString = "CUshared";   break;
+      case LangAS::cuda_device:
+        ASString = "CUdevice";
+        break;
+      case LangAS::cuda_constant:
+        ASString = "CUconstant";
+        break;
+      case LangAS::cuda_shared:
+        ASString = "CUshared";
+        break;
       //  <ptrsize-addrspace> ::= [ "ptr32_sptr" | "ptr32_uptr" | "ptr64" ]
       case LangAS::ptr32_sptr:
         ASString = "ptr32_sptr";
@@ -2820,10 +2846,18 @@ void CXXNameMangler::mangleType(const BuiltinType *T) {
   // The SVE types are effectively target-specific.  The mangling scheme
   // is defined in the appendices to the Procedure Call Standard for the
   // Arm Architecture.
-#define SVE_TYPE(Name, Id, SingletonId) \
-  case BuiltinType::Id: \
-    type_name = Name; \
-    Out << 'u' << type_name.size() << type_name; \
+#define SVE_VECTOR_TYPE(InternalName, MangledName, Id, SingletonId, NumEls,    \
+                        ElBits, IsSigned, IsFP, IsBF)                          \
+  case BuiltinType::Id:                                                        \
+    type_name = MangledName;                                                   \
+    Out << (type_name == InternalName ? "u" : "") << type_name.size()          \
+        << type_name;                                                          \
+    break;
+#define SVE_PREDICATE_TYPE(InternalName, MangledName, Id, SingletonId, NumEls) \
+  case BuiltinType::Id:                                                        \
+    type_name = MangledName;                                                   \
+    Out << (type_name == InternalName ? "u" : "") << type_name.size()          \
+        << type_name;                                                          \
     break;
 #include "clang/Basic/AArch64SVEACLETypes.def"
   }
@@ -5216,6 +5250,18 @@ void ItaniumMangleContextImpl::mangleDynamicAtExitDestructor(const VarDecl *D,
   // Prefix the mangling of D with __dtor_.
   CXXNameMangler Mangler(*this, Out);
   Mangler.getStream() << "__dtor_";
+  if (shouldMangleDeclName(D))
+    Mangler.mangle(D);
+  else
+    Mangler.getStream() << D->getName();
+}
+
+void ItaniumMangleContextImpl::mangleDynamicStermFinalizer(const VarDecl *D,
+                                                           raw_ostream &Out) {
+  // Clang generates these internal-linkage functions as part of its
+  // implementation of the XL ABI.
+  CXXNameMangler Mangler(*this, Out);
+  Mangler.getStream() << "__finalize_";
   if (shouldMangleDeclName(D))
     Mangler.mangle(D);
   else

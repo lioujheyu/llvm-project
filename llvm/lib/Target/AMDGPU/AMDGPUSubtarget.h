@@ -67,6 +67,8 @@ private:
 protected:
   bool Has16BitInsts;
   bool HasMadMixInsts;
+  bool HasMadMacF32Insts;
+  bool HasDsSrc2Insts;
   bool HasSDWA;
   bool HasVOP3PInsts;
   bool HasMulI24;
@@ -140,12 +142,24 @@ public:
     return isAmdHsaOS() || isMesaKernel(F);
   }
 
+  bool isGCN() const {
+    return TargetTriple.getArch() == Triple::amdgcn;
+  }
+
   bool has16BitInsts() const {
     return Has16BitInsts;
   }
 
   bool hasMadMixInsts() const {
     return HasMadMixInsts;
+  }
+
+  bool hasMadMacF32Insts() const {
+    return HasMadMacF32Insts || !isGCN();
+  }
+
+  bool hasDsSrc2Insts() const {
+    return HasDsSrc2Insts;
   }
 
   bool hasSDWA() const {
@@ -300,7 +314,7 @@ protected:
   bool AutoWaitcntBeforeBarrier;
   bool CodeObjectV3;
   bool UnalignedScratchAccess;
-  bool UnalignedBufferAccess;
+  bool UnalignedAccessMode;
   bool HasApertureRegs;
   bool EnableXNACK;
   bool DoesNotSupportXNACK;
@@ -325,6 +339,7 @@ protected:
   bool GFX8Insts;
   bool GFX9Insts;
   bool GFX10Insts;
+  bool GFX10_3Insts;
   bool GFX7GFX8GFX9Insts;
   bool SGPRInitBug;
   bool HasSMemRealTime;
@@ -343,7 +358,9 @@ protected:
   bool HasDPP8;
   bool HasR128A16;
   bool HasGFX10A16;
+  bool HasG16;
   bool HasNSAEncoding;
+  bool GFX10_BEncoding;
   bool HasDLInsts;
   bool HasDot1Insts;
   bool HasDot2Insts;
@@ -358,6 +375,8 @@ protected:
   bool DoesNotSupportSRAMECC;
   bool HasNoSdstCMPX;
   bool HasVscnt;
+  bool HasGetWaveIdInst;
+  bool HasSMemTimeInst;
   bool HasRegisterBanking;
   bool HasVOP3Literal;
   bool HasNoDataDepHazard;
@@ -375,6 +394,8 @@ protected:
   bool HasMFMAInlineLiteralBug;
   bool HasVertexCache;
   short TexVTXClauseSize;
+  bool UnalignedBufferAccess;
+  bool UnalignedDSAccess;
   bool ScalarizeGlobal;
 
   bool HasVcmpxPermlaneHazard;
@@ -452,7 +473,7 @@ public:
     return &InstrItins;
   }
 
-  void ParseSubtargetFeatures(StringRef CPU, StringRef FS);
+  void ParseSubtargetFeatures(StringRef CPU, StringRef TuneCPU, StringRef FS);
 
   Generation getGeneration() const {
     return (Generation)Gen;
@@ -646,6 +667,11 @@ public:
     return CIInsts && EnableDS128;
   }
 
+  /// \return If target supports ds_read/write_b96/128.
+  bool hasDS96AndDS128() const {
+    return CIInsts;
+  }
+
   /// Have v_trunc_f64, v_ceil_f64, v_rndne_f64
   bool haveRoundOpsF64() const {
     return CIInsts;
@@ -676,8 +702,24 @@ public:
     return UnalignedBufferAccess;
   }
 
+  bool hasUnalignedBufferAccessEnabled() const {
+    return UnalignedBufferAccess && UnalignedAccessMode;
+  }
+
+  bool hasUnalignedDSAccess() const {
+    return UnalignedDSAccess;
+  }
+
+  bool hasUnalignedDSAccessEnabled() const {
+    return UnalignedDSAccess && UnalignedAccessMode;
+  }
+
   bool hasUnalignedScratchAccess() const {
     return UnalignedScratchAccess;
+  }
+
+  bool hasUnalignedAccessMode() const {
+    return UnalignedAccessMode;
   }
 
   bool hasApertureRegs() const {
@@ -718,6 +760,14 @@ public:
 
   bool hasScalarFlatScratchInsts() const {
     return ScalarFlatScratchInsts;
+  }
+
+  bool hasGlobalAddTidInsts() const {
+    return GFX10_BEncoding;
+  }
+
+  bool hasAtomicCSub() const {
+    return GFX10_BEncoding;
   }
 
   bool hasMultiDwordFlatScratchAddressing() const {
@@ -764,6 +814,10 @@ public:
     return CIInsts;
   }
 
+  /// \returns true if the target has integer add/sub instructions that do not
+  /// produce a carry-out. This includes v_add_[iu]32, v_sub_[iu]32,
+  /// v_add_[iu]16, and v_sub_[iu]16, all of which support the clamp modifier
+  /// for saturation.
   bool hasAddNoCarry() const {
     return AddNoCarryInsts;
   }
@@ -851,6 +905,14 @@ public:
 
   bool hasVscnt() const {
     return HasVscnt;
+  }
+
+  bool hasGetWaveIdInst() const {
+    return HasGetWaveIdInst;
+  }
+
+  bool hasSMemTimeInst() const {
+    return HasSMemTimeInst;
   }
 
   bool hasRegisterBanking() const {
@@ -959,12 +1021,24 @@ public:
     return HasGFX10A16;
   }
 
+  bool hasA16() const { return hasR128A16() || hasGFX10A16(); }
+
+  bool hasG16() const { return HasG16; }
+
   bool hasOffset3fBug() const {
     return HasOffset3fBug;
   }
 
   bool hasNSAEncoding() const {
     return HasNSAEncoding;
+  }
+
+  bool hasGFX10_BEncoding() const {
+    return GFX10_BEncoding;
+  }
+
+  bool hasGFX10_3Insts() const {
+    return GFX10_3Insts;
   }
 
   bool hasMadF16() const;
@@ -992,10 +1066,6 @@ public:
   // \returns true if the subtarget supports DWORDX3 load/store instructions.
   bool hasDwordx3LoadStores() const {
     return CIInsts;
-  }
-
-  bool hasSMovFedHazard() const {
-    return getGeneration() == AMDGPUSubtarget::GFX9;
   }
 
   bool hasReadM0MovRelInterpHazard() const {
@@ -1053,7 +1123,7 @@ public:
   /// registers if provided.
   /// Note, occupancy can be affected by the scratch allocation as well, but
   /// we do not have enough information to compute it.
-  unsigned computeOccupancy(const MachineFunction &MF, unsigned LDSSize = 0,
+  unsigned computeOccupancy(const Function &F, unsigned LDSSize = 0,
                             unsigned NumSGPRs = 0, unsigned NumVGPRs = 0) const;
 
   /// \returns true if the flat_scratch register should be initialized with the
@@ -1163,6 +1233,10 @@ public:
     return getWavefrontSize() == 32;
   }
 
+  bool isWave64() const {
+    return getWavefrontSize() == 64;
+  }
+
   const TargetRegisterClass *getBoolRC() const {
     return getRegisterInfo()->getBoolRC();
   }
@@ -1244,7 +1318,7 @@ public:
     return &TSInfo;
   }
 
-  void ParseSubtargetFeatures(StringRef CPU, StringRef FS);
+  void ParseSubtargetFeatures(StringRef CPU, StringRef TuneCPU, StringRef FS);
 
   Generation getGeneration() const {
     return Gen;

@@ -68,7 +68,12 @@ struct Symbol {
   XCOFF::StorageClass getStorageClass() const {
     return MCSym->getStorageClass();
   }
-  StringRef getName() const { return MCSym->getName(); }
+
+  XCOFF::VisibilityType getVisibilityType() const {
+    return MCSym->getVisibilityType();
+  }
+
+  StringRef getSymbolTableName() const { return MCSym->getSymbolTableName(); }
   Symbol(const MCSymbolXCOFF *MCSym) : MCSym(MCSym), SymbolTableIndex(-1) {}
 };
 
@@ -81,7 +86,7 @@ struct ControlSection {
 
   SmallVector<Symbol, 1> Syms;
   SmallVector<XCOFFRelocation, 1> Relocations;
-  StringRef getName() const { return MCCsect->getName(); }
+  StringRef getSymbolTableName() const { return MCCsect->getSymbolTableName(); }
   ControlSection(const MCSectionXCOFF *MCSec)
       : MCCsect(MCSec), SymbolTableIndex(-1), Address(-1), Size(0) {}
 };
@@ -334,8 +339,8 @@ void XCOFFObjectWriter::executePostLayoutBinding(MCAssembler &Asm,
 
     // If the name does not fit in the storage provided in the symbol table
     // entry, add it to the string table.
-    if (nameShouldBeInStringTable(MCSec->getName()))
-      Strings.add(MCSec->getName());
+    if (nameShouldBeInStringTable(MCSec->getSymbolTableName()))
+      Strings.add(MCSec->getSymbolTableName());
 
     CsectGroup &Group = getCsectGroup(MCSec);
     Group.emplace_back(MCSec);
@@ -354,8 +359,8 @@ void XCOFFObjectWriter::executePostLayoutBinding(MCAssembler &Asm,
       // Handle undefined symbol.
       UndefinedCsects.emplace_back(ContainingCsect);
       SectionMap[ContainingCsect] = &UndefinedCsects.back();
-      if (nameShouldBeInStringTable(ContainingCsect->getName()))
-        Strings.add(ContainingCsect->getName());
+      if (nameShouldBeInStringTable(ContainingCsect->getSymbolTableName()))
+        Strings.add(ContainingCsect->getSymbolTableName());
       continue;
     }
 
@@ -375,8 +380,8 @@ void XCOFFObjectWriter::executePostLayoutBinding(MCAssembler &Asm,
 
     // If the name does not fit in the storage provided in the symbol table
     // entry, add it to the string table.
-    if (nameShouldBeInStringTable(XSym->getName()))
-      Strings.add(XSym->getName());
+    if (nameShouldBeInStringTable(XSym->getSymbolTableName()))
+      Strings.add(XSym->getSymbolTableName());
   }
 
   Strings.finalize();
@@ -555,19 +560,18 @@ void XCOFFObjectWriter::writeSymbolTableEntryForCsectMemberLabel(
     const Symbol &SymbolRef, const ControlSection &CSectionRef,
     int16_t SectionIndex, uint64_t SymbolOffset) {
   // Name or Zeros and string table offset
-  writeSymbolName(SymbolRef.getName());
+  writeSymbolName(SymbolRef.getSymbolTableName());
   assert(SymbolOffset <= UINT32_MAX - CSectionRef.Address &&
          "Symbol address overflows.");
   W.write<uint32_t>(CSectionRef.Address + SymbolOffset);
   W.write<int16_t>(SectionIndex);
   // Basic/Derived type. See the description of the n_type field for symbol
-  // table entries for a detailed description. Since we don't yet support
-  // visibility, and all other bits are either optionally set or reserved, this
-  // is always zero.
-  // TODO FIXME How to assert a symbol's visibilty is default?
+  // table entries for a detailed description. Since we support visibility, and
+  // all other bits are either optionally set or reserved, we only set bits 0-3
+  // for symbol's visibility and leave other bits to zero.
   // TODO Set the function indicator (bit 10, 0x0020) for functions
   // when debugging is enabled.
-  W.write<uint16_t>(0);
+  W.write<uint16_t>(SymbolRef.getVisibilityType());
   W.write<uint8_t>(SymbolRef.getStorageClass());
   // Always 1 aux entry for now.
   W.write<uint8_t>(1);
@@ -592,19 +596,18 @@ void XCOFFObjectWriter::writeSymbolTableEntryForControlSection(
     const ControlSection &CSectionRef, int16_t SectionIndex,
     XCOFF::StorageClass StorageClass) {
   // n_name, n_zeros, n_offset
-  writeSymbolName(CSectionRef.getName());
+  writeSymbolName(CSectionRef.getSymbolTableName());
   // n_value
   W.write<uint32_t>(CSectionRef.Address);
   // n_scnum
   W.write<int16_t>(SectionIndex);
   // Basic/Derived type. See the description of the n_type field for symbol
-  // table entries for a detailed description. Since we don't yet support
-  // visibility, and all other bits are either optionally set or reserved, this
-  // is always zero.
-  // TODO FIXME How to assert a symbol's visibilty is default?
+  // table entries for a detailed description. Since we support visibility, and
+  // all other bits are either optionally set or reserved, we only set bits 0-3
+  // for symbol's visibility and leave other bits to zero.
   // TODO Set the function indicator (bit 10, 0x0020) for functions
   // when debugging is enabled.
-  W.write<uint16_t>(0);
+  W.write<uint16_t>(CSectionRef.MCCsect->getVisibilityType());
   // n_sclass
   W.write<uint8_t>(StorageClass);
   // Always 1 aux entry for now.

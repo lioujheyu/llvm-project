@@ -8,6 +8,7 @@
 
 #include "lldb/Utility/Reproducer.h"
 #include "lldb/Utility/LLDBAssert.h"
+#include "lldb/Utility/ReproducerProvider.h"
 
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Threading.h"
@@ -157,7 +158,7 @@ FileSpec Reproducer::GetReproducerPath() const {
   return {};
 }
 
-static FileSpec MakeAbsolute(FileSpec file_spec) {
+static FileSpec MakeAbsolute(const FileSpec &file_spec) {
   SmallString<128> path;
   file_spec.GetPath(path, false);
   llvm::sys::fs::make_absolute(path);
@@ -166,6 +167,7 @@ static FileSpec MakeAbsolute(FileSpec file_spec) {
 
 Generator::Generator(FileSpec root) : m_root(MakeAbsolute(std::move(root))) {
   GetOrCreate<repro::WorkingDirectoryProvider>();
+  GetOrCreate<repro::HomeDirectoryProvider>();
 }
 
 Generator::~Generator() {
@@ -262,84 +264,3 @@ bool Loader::HasFile(StringRef file) {
   auto it = std::lower_bound(m_files.begin(), m_files.end(), file.str());
   return (it != m_files.end()) && (*it == file);
 }
-
-llvm::Expected<std::unique_ptr<DataRecorder>>
-DataRecorder::Create(const FileSpec &filename) {
-  std::error_code ec;
-  auto recorder = std::make_unique<DataRecorder>(std::move(filename), ec);
-  if (ec)
-    return llvm::errorCodeToError(ec);
-  return std::move(recorder);
-}
-
-DataRecorder *CommandProvider::GetNewDataRecorder() {
-  std::size_t i = m_data_recorders.size() + 1;
-  std::string filename = (llvm::Twine(Info::name) + llvm::Twine("-") +
-                          llvm::Twine(i) + llvm::Twine(".yaml"))
-                             .str();
-  auto recorder_or_error =
-      DataRecorder::Create(GetRoot().CopyByAppendingPathComponent(filename));
-  if (!recorder_or_error) {
-    llvm::consumeError(recorder_or_error.takeError());
-    return nullptr;
-  }
-
-  m_data_recorders.push_back(std::move(*recorder_or_error));
-  return m_data_recorders.back().get();
-}
-
-void CommandProvider::Keep() {
-  std::vector<std::string> files;
-  for (auto &recorder : m_data_recorders) {
-    recorder->Stop();
-    files.push_back(recorder->GetFilename().GetPath());
-  }
-
-  FileSpec file = GetRoot().CopyByAppendingPathComponent(Info::file);
-  std::error_code ec;
-  llvm::raw_fd_ostream os(file.GetPath(), ec, llvm::sys::fs::OF_Text);
-  if (ec)
-    return;
-  yaml::Output yout(os);
-  yout << files;
-}
-
-void CommandProvider::Discard() { m_data_recorders.clear(); }
-
-void VersionProvider::Keep() {
-  FileSpec file = GetRoot().CopyByAppendingPathComponent(Info::file);
-  std::error_code ec;
-  llvm::raw_fd_ostream os(file.GetPath(), ec, llvm::sys::fs::OF_Text);
-  if (ec)
-    return;
-  os << m_version << "\n";
-}
-
-void WorkingDirectoryProvider::Keep() {
-  FileSpec file = GetRoot().CopyByAppendingPathComponent(Info::file);
-  std::error_code ec;
-  llvm::raw_fd_ostream os(file.GetPath(), ec, llvm::sys::fs::OF_Text);
-  if (ec)
-    return;
-  os << m_cwd << "\n";
-}
-
-void FileProvider::recordInterestingDirectory(const llvm::Twine &dir) {
-  if (m_collector)
-    m_collector->addDirectory(dir);
-}
-
-void ProviderBase::anchor() {}
-char CommandProvider::ID = 0;
-char FileProvider::ID = 0;
-char ProviderBase::ID = 0;
-char VersionProvider::ID = 0;
-char WorkingDirectoryProvider::ID = 0;
-const char *CommandProvider::Info::file = "command-interpreter.yaml";
-const char *CommandProvider::Info::name = "command-interpreter";
-const char *FileProvider::Info::file = "files.yaml";
-const char *FileProvider::Info::name = "files";
-const char *VersionProvider::Info::file = "version.txt";
-const char *VersionProvider::Info::name = "version";
-const char *WorkingDirectoryProvider::Info::file = "cwd.txt";
-const char *WorkingDirectoryProvider::Info::name = "cwd";

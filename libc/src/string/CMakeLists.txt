@@ -1,5 +1,13 @@
 add_subdirectory(memory_utils)
 
+add_header_library(
+  string_utils
+  HDRS
+    string_utils.h
+  DEPENDS
+    libc.utils.CPP.standalone_cpp
+)
+
 add_entrypoint_object(
   strcat
   SRCS
@@ -34,6 +42,116 @@ add_entrypoint_object(
     libc.include.string
 )
 
+add_entrypoint_object(
+  strcmp
+  SRCS
+    strcmp.cpp
+  HDRS
+    strcmp.h
+  DEPENDS
+    libc.include.string
+)
+
+add_entrypoint_object(
+  memchr
+  SRCS
+    memchr.cpp
+  HDRS
+    memchr.h
+)
+
+add_entrypoint_object(
+  strchr
+  SRCS
+    strchr.cpp
+  HDRS
+    strchr.h
+)
+
+add_entrypoint_object(
+  strstr
+  SRCS
+    strstr.cpp
+  HDRS
+    strstr.h
+)
+
+add_entrypoint_object(
+  strnlen
+  SRCS
+    strnlen.cpp
+  HDRS
+    strnlen.h
+  DEPENDS
+    .memchr
+)
+
+add_entrypoint_object(
+  memrchr
+  SRCS
+    memrchr.cpp
+  HDRS
+    memrchr.h
+)
+
+add_entrypoint_object(
+  strrchr
+  SRCS
+    strrchr.cpp
+  HDRS
+    strrchr.h
+)
+
+add_entrypoint_object(
+  strcspn
+  SRCS
+    strcspn.cpp
+  HDRS
+    strcspn.h
+  DEPENDS
+    .string_utils
+)
+
+add_entrypoint_object(
+  strspn
+  SRCS
+    strspn.cpp
+  HDRS
+    strspn.h
+  DEPENDS
+    libc.utils.CPP.standalone_cpp
+)
+
+add_entrypoint_object(
+  strpbrk
+  SRCS
+    strpbrk.cpp
+  HDRS
+    strpbrk.h
+  DEPENDS
+    .string_utils
+)
+
+add_entrypoint_object(
+  strtok
+  SRCS
+    strtok.cpp
+  HDRS
+    strtok.h
+  DEPENDS
+    .string_utils
+)
+
+add_entrypoint_object(
+  strtok_r
+  SRCS
+    strtok_r.cpp
+  HDRS
+    strtok_r.h
+  DEPENDS
+    .string_utils
+)
+
 # Helper to define a function with multiple implementations
 # - Computes flags to satisfy required/rejected features and arch,
 # - Declares an entry point,
@@ -56,7 +174,7 @@ function(add_implementation name impl_name)
     SRCS ${ADD_IMPL_SRCS}
     HDRS ${ADD_IMPL_HDRS}
     DEPENDS ${ADD_IMPL_DEPENDS}
-    COMPILE_OPTIONS ${ADD_IMPL_COMPILE_OPTIONS} ${flags}
+    COMPILE_OPTIONS ${ADD_IMPL_COMPILE_OPTIONS} ${flags} -O2
   )
   get_fq_target_name(${impl_name} fq_target_name)
   set_target_properties(${fq_target_name} PROPERTIES REQUIRE_CPU_FEATURES "${ADD_IMPL_REQUIRE}")
@@ -70,13 +188,15 @@ endfunction()
 # include the relevant architecture specific implementations
 if(${LIBC_TARGET_MACHINE} STREQUAL "x86_64")
   set(LIBC_STRING_TARGET_ARCH "x86")
+  set(MEMCPY_SRC ${LIBC_SOURCE_DIR}/src/string/x86/memcpy.cpp)
 else()
   set(LIBC_STRING_TARGET_ARCH ${LIBC_TARGET_MACHINE})
+  set(MEMCPY_SRC ${LIBC_SOURCE_DIR}/src/string/memcpy.cpp)
 endif()
 
 function(add_memcpy memcpy_name)
   add_implementation(memcpy ${memcpy_name}
-    SRCS ${LIBC_SOURCE_DIR}/src/string/${LIBC_STRING_TARGET_ARCH}/memcpy.cpp
+    SRCS ${MEMCPY_SRC}
     HDRS ${LIBC_SOURCE_DIR}/src/string/memcpy.h
     DEPENDS
       .memory_utils.memory_utils
@@ -87,7 +207,11 @@ function(add_memcpy memcpy_name)
   )
 endfunction()
 
-add_memcpy(memcpy MARCH native)
+if(${LIBC_STRING_TARGET_ARCH} STREQUAL "x86")
+  add_memcpy(memcpy MARCH native)
+else()
+  add_memcpy(memcpy)
+endif()
 
 # ------------------------------------------------------------------------------
 # memset
@@ -106,7 +230,11 @@ function(add_memset memset_name)
   )
 endfunction()
 
-add_memset(memset MARCH native)
+if(${LIBC_STRING_TARGET_ARCH} STREQUAL "x86")
+  add_memset(memset MARCH native)
+else()
+  add_memset(memset)
+endif()
 
 # ------------------------------------------------------------------------------
 # bzero
@@ -126,12 +254,16 @@ function(add_bzero bzero_name)
   )
 endfunction()
 
-add_bzero(bzero MARCH native)
+if(${LIBC_STRING_TARGET_ARCH} STREQUAL "x86")
+  add_bzero(bzero MARCH native)
+else()
+  add_bzero(bzero)
+endif()
 
 # ------------------------------------------------------------------------------
 # Add all other relevant implementations for the native target.
 # ------------------------------------------------------------------------------
 
-if(EXISTS ${LIBC_STRING_TARGET_ARCH})
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${LIBC_STRING_TARGET_ARCH})
   include(${LIBC_STRING_TARGET_ARCH}/CMakeLists.txt)
 endif()

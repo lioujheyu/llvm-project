@@ -380,6 +380,28 @@ void __msan_warning_noreturn() {
   Die();
 }
 
+void __msan_warning_with_origin(u32 origin) {
+  GET_CALLER_PC_BP_SP;
+  (void)sp;
+  PrintWarningWithOrigin(pc, bp, origin);
+  if (__msan::flags()->halt_on_error) {
+    if (__msan::flags()->print_stats)
+      ReportStats();
+    Printf("Exiting\n");
+    Die();
+  }
+}
+
+void __msan_warning_with_origin_noreturn(u32 origin) {
+  GET_CALLER_PC_BP_SP;
+  (void)sp;
+  PrintWarningWithOrigin(pc, bp, origin);
+  if (__msan::flags()->print_stats)
+    ReportStats();
+  Printf("Exiting\n");
+  Die();
+}
+
 static void OnStackUnwind(const SignalContext &sig, const void *,
                           BufferedStackTrace *stack) {
   stack->Unwind(StackTrace::GetNextInstructionPc(sig.pc), sig.bp, sig.context,
@@ -505,6 +527,9 @@ void __msan_dump_shadow(const void *x, uptr size) {
 sptr __msan_test_shadow(const void *x, uptr size) {
   if (!MEM_IS_APP(x)) return -1;
   unsigned char *s = (unsigned char *)MEM_TO_SHADOW((uptr)x);
+  if (__sanitizer::mem_is_zero((const char *)s, size))
+    return -1;
+  // Slow path: loop through again to find the location.
   for (uptr i = 0; i < size; ++i)
     if (s[i])
       return i;

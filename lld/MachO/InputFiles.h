@@ -40,6 +40,7 @@ public:
     ObjKind,
     DylibKind,
     ArchiveKind,
+    OpaqueKind,
   };
 
   virtual ~InputFile() = default;
@@ -72,10 +73,18 @@ public:
   static bool classof(const InputFile *f) { return f->kind() == ObjKind; }
 };
 
+// command-line -sectcreate file
+class OpaqueFile : public InputFile {
+public:
+  explicit OpaqueFile(MemoryBufferRef mb, StringRef segName,
+                      StringRef sectName);
+  static bool classof(const InputFile *f) { return f->kind() == OpaqueKind; }
+};
+
 // .dylib file
 class DylibFile : public InputFile {
 public:
-  explicit DylibFile(std::shared_ptr<llvm::MachO::InterfaceFile> interface,
+  explicit DylibFile(const llvm::MachO::InterfaceFile &interface,
                      DylibFile *umbrella = nullptr);
 
   // Mach-O dylibs can re-export other dylibs as sub-libraries, meaning that the
@@ -88,11 +97,6 @@ public:
   explicit DylibFile(MemoryBufferRef mb, DylibFile *umbrella = nullptr);
 
   static bool classof(const InputFile *f) { return f->kind() == DylibKind; }
-
-  // Do not use this constructor!! This is meant only for createLibSystemMock(),
-  // but it cannot be made private as we call it via make().
-  DylibFile();
-  static DylibFile *createLibSystemMock();
 
   StringRef dylibName;
   uint64_t ordinal = 0; // Ordinal numbering starts from 1, so 0 is a sentinel

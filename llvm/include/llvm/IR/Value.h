@@ -470,6 +470,12 @@ public:
   void dropDroppableUses(llvm::function_ref<bool(const Use *)> ShouldDrop =
                              [](const Use *) { return true; });
 
+  /// Remove every use of this value in \p User that can safely be removed.
+  void dropDroppableUsesIn(User &Usr);
+
+  /// Remove the droppable use \p U.
+  void dropDroppableUse(Use &U);
+
   /// Check if this value is used in the specified basic block.
   bool isUsedInBasicBlock(const BasicBlock *BB) const;
 
@@ -646,10 +652,12 @@ public:
   ///
   /// Returns the original pointer value.  If this is called on a non-pointer
   /// value, it returns 'this'.
-  const Value *stripInBoundsOffsets() const;
-  Value *stripInBoundsOffsets() {
+  const Value *stripInBoundsOffsets(function_ref<void(const Value *)> Func =
+                                        [](const Value *) {}) const;
+  inline Value *stripInBoundsOffsets(function_ref<void(const Value *)> Func =
+                                  [](const Value *) {}) {
     return const_cast<Value *>(
-                      static_cast<const Value *>(this)->stripInBoundsOffsets());
+        static_cast<const Value *>(this)->stripInBoundsOffsets(Func));
   }
 
   /// Returns the number of bytes known to be dereferenceable for the

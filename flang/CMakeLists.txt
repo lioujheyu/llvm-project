@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.9.0)
+cmake_minimum_required(VERSION 3.13.4)
 
 # RPATH settings on macOS do not affect INSTALL_NAME.
 if (POLICY CMP0068)
@@ -37,19 +37,14 @@ endif()
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/modules")
 include(AddFlang)
 
-if (MSVC)
-  set(_FLANG_ENABLE_WERROR_DEFAULT OFF)
-else ()
-  set(_FLANG_ENABLE_WERROR_DEFAULT ON)
-endif()
-option(FLANG_ENABLE_WERROR "Fail and stop building flang if a warning is triggered."
-       "${_FLANG_ENABLE_WERROR_DEFAULT}")
+option(FLANG_ENABLE_WERROR "Fail and stop building flang if a warning is triggered." OFF)
 
 # Check for a standalone build and configure as appropriate from
 # there.
 if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   message("Building Flang as a standalone project.")
   project(Flang)
+  set(FLANG_STANDALONE_BUILD ON)
 
   set(FLANG_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR})
   if (NOT MSVC_IDE)
@@ -69,6 +64,9 @@ if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   endif()
   option(LLVM_ENABLE_WARNINGS "Enable compiler warnings." ON)
   option(LLVM_ENABLE_PEDANTIC "Compile with pedantic enabled." ON)
+  if(CMAKE_COMPILER_IS_GNUCXX)
+    set(USE_NO_MAYBE_UNINITIALIZED 1)
+  endif()
 
   include(CMakeParseArguments)
   include(AddLLVM)
@@ -130,16 +128,67 @@ if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   option(FLANG_INCLUDE_TESTS
          "Generate build targets for the Flang unit tests."
          ON)
-  add_custom_target(check-all DEPENDS check-flang)
+
+#Handle unittests when out-of-tree
+#LLVM_BUILD_MAIN_SRC_DIR - Path to llvm source when out-of-tree.
+  set(FLANG_GTEST_AVAIL 0)
+  if (FLANG_INCLUDE_TESTS)
+    set(UNITTEST_DIR ${LLVM_BUILD_MAIN_SRC_DIR}/utils/unittest)
+    if(EXISTS ${UNITTEST_DIR}/googletest/include/gtest/gtest.h)
+      if (TARGET gtest)
+        # LLVM Doesn't export gtest's include directorys, so do that here
+        set_target_properties(gtest
+          PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
+          "${UNITTEST_DIR}/googletest/include;${UNITTEST_DIR}/googlemock/include"
+          )
+      else()
+        add_library(gtest
+          ${UNITTEST_DIR}/googletest/src/gtest-all.cc
+          ${UNITTEST_DIR}/googlemock/src/gmock-all.cc
+          )
+        target_include_directories(gtest
+          PUBLIC
+          "${UNITTEST_DIR}/googletest/include"
+          "${UNITTEST_DIR}/googlemock/include"
+
+          PRIVATE
+          "${UNITTEST_DIR}/googletest"
+          "${UNITTEST_DIR}/googlemock"
+          )
+         find_package(Threads)
+         target_link_libraries(gtest PUBLIC Threads::Threads)
+        add_library(gtest_main ${UNITTEST_DIR}/UnitTestMain/TestMain.cpp)
+        target_link_libraries(gtest_main PUBLIC gtest)
+      endif()
+      set(FLANG_GTEST_AVAIL 1)
+    else()
+      message(WARNING
+      "Unit-tests will be skipped as LLVM install does not include google-test related headers and libraries.")
+      set(FLANG_GTEST_AVAIL 0)
+    endif()
+  endif()
+  if (FLANG_GTEST_AVAIL)
+    add_custom_target(check-all DEPENDS check-flang FlangUnitTests)
+  else()
+    add_custom_target(check-all DEPENDS check-flang )
+  endif()
   if (LLVM_BUILD_DOCS)
     add_custom_target(doxygen ALL)
   endif()
 
 else()
+  set(FLANG_STANDALONE_BUILD OFF)
   option(FLANG_INCLUDE_TESTS
          "Generate build targets for the Flang unit tests."
          ${LLVM_INCLUDE_TESTS})
-  set(FLANG_BINARY_DIR ${CMAKE_BINARY_DIR}/tools/flang)
+  set(FLANG_GTEST_AVAIL 1)
+
+  if(FLANG_STANDALONE_BUILD)
+    set(FLANG_BINARY_DIR ${CMAKE_BINARY_DIR}/tools/flang)
+  else()
+    set(FLANG_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR})
+  endif()
+
   set(BACKEND_PACKAGE_STRING "${PACKAGE_STRING}")
   if (LINK_WITH_FIR)
     set(MLIR_MAIN_SRC_DIR ${LLVM_MAIN_SRC_DIR}/../mlir/include ) # --src-root
@@ -153,8 +202,10 @@ endif()
 
 if(LINK_WITH_FIR)
   # tco tool and FIR lib output directories
-  set(LLVM_RUNTIME_OUTPUT_INTDIR ${CMAKE_BINARY_DIR}/bin)
-  set(LLVM_LIBRARY_OUTPUT_INTDIR ${CMAKE_BINARY_DIR}/lib)
+  if(FLANG_STANDALONE_BUILD)
+    set(LLVM_RUNTIME_OUTPUT_INTDIR ${CMAKE_BINARY_DIR}/bin)
+    set(LLVM_LIBRARY_OUTPUT_INTDIR ${CMAKE_BINARY_DIR}/lib)
+  endif()
   # Always build tco tool
   set(LLVM_BUILD_TOOLS ON)
   message(STATUS "Linking driver with FIR and LLVM")
@@ -258,9 +309,6 @@ if (FLANG_ENABLE_WERROR)
     append("-Werror" CMAKE_C_FLAGS CMAKE_CXX_FLAGS)
     append("-Wno-error" CMAKE_REQUIRED_FLAGS)
   endif( LLVM_COMPILER_IS_GCC_COMPATIBLE )
-  if (NOT LLVM_ENABLE_WERROR)
-      message(WARNING "FLANG_ENABLE_WERROR setting is different from LLVM_ENABLE_WERROR.")
-  endif()
 endif()
 
 # Builtin check_cxx_compiler_flag doesn't seem to work correctly
@@ -342,9 +390,10 @@ endif()
 add_subdirectory(runtime)
 
 if (FLANG_INCLUDE_TESTS)
-  enable_testing()
   add_subdirectory(test)
-  add_subdirectory(unittests)
+  if (FLANG_GTEST_AVAIL)
+    add_subdirectory(unittests)
+  endif ()
 endif()
 
 option(FLANG_INCLUDE_DOCS "Generate build targets for the Flang docs."

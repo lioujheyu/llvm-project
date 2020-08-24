@@ -1,4 +1,5 @@
 add_subdirectory(assert)
+add_subdirectory(ctype)
 add_subdirectory(errno)
 add_subdirectory(math)
 add_subdirectory(signal)
@@ -30,7 +31,7 @@ add_custom_command(
           ${LIBC_SOURCE_DIR}/config/${LIBC_TARGET_OS}/api.td
 
   DEPENDS ${LIBC_SOURCE_DIR}/config/${LIBC_TARGET_OS}/api.td
-          libc-prototype-testgen ${PUBLIC_HEADERS}
+          libc-prototype-testgen ${TARGET_PUBLIC_HEADERS}
           llvmlibc llvmlibm
 )
 

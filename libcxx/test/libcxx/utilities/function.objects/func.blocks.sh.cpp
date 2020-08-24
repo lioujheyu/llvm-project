@@ -14,13 +14,14 @@
 // on Darwin out-of-the-box.
 // REQUIRES: has-fblocks && darwin
 
-// FILE_DEPENDENCIES: %t.exe
 // RUN: %{build} -fblocks
 // RUN: %{run}
 
 #include <functional>
 #include <cstdlib>
 #include <cassert>
+
+#include <Block.h>
 
 #include "test_macros.h"
 #include "count_new.h"

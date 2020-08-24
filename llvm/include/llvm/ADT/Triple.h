@@ -19,6 +19,8 @@
 
 namespace llvm {
 
+class VersionTuple;
+
 /// Triple - Helper class for working with autoconf configuration names. For
 /// historical reasons, we also call these 'triples' (they used to contain
 /// exactly three fields).
@@ -140,8 +142,6 @@ public:
     Apple,
     PC,
     SCEI,
-    BGP,
-    BGQ,
     Freescale,
     IBM,
     ImaginationTechnologies,
@@ -173,11 +173,11 @@ public:
     OpenBSD,
     Solaris,
     Win32,
+    ZOS,
     Haiku,
     Minix,
     RTEMS,
     NaCl,       // Native Client
-    CNK,        // BG/P Compute-Node Kernel
     AIX,
     CUDA,       // NVIDIA CUDA
     NVCL,       // NVIDIA OpenCL
@@ -225,6 +225,7 @@ public:
 
     COFF,
     ELF,
+    GOFF,
     MachO,
     Wasm,
     XCOFF,
@@ -438,17 +439,7 @@ public:
   /// compatibility, which handles supporting skewed version numbering schemes
   /// used by the "darwin" triples.
   bool isMacOSXVersionLT(unsigned Major, unsigned Minor = 0,
-                         unsigned Micro = 0) const {
-    assert(isMacOSX() && "Not an OS X triple!");
-
-    // If this is OS X, expect a sane version number.
-    if (getOS() == Triple::MacOSX)
-      return isOSVersionLT(Major, Minor, Micro);
-
-    // Otherwise, compare to the "Darwin" number.
-    assert(Major == 10 && "Unexpected major version");
-    return isOSVersionLT(Minor + 4, Micro, 0);
-  }
+                         unsigned Micro = 0) const;
 
   /// isMacOSX - Is this a Mac OS X triple. For legacy reasons, we support both
   /// "darwin" and "osx" as OS X triples.
@@ -478,6 +469,8 @@ public:
   bool isWatchABI() const {
     return getSubArch() == Triple::ARMSubArch_v7k;
   }
+
+  bool isOSzOS() const { return getOS() == Triple::ZOS; }
 
   /// isOSDarwin - Is this a "Darwin" OS (macOS, iOS, tvOS or watchOS).
   bool isOSDarwin() const {
@@ -630,6 +623,9 @@ public:
   bool isOSBinFormatCOFF() const {
     return getObjectFormat() == Triple::COFF;
   }
+
+  /// Tests whether the OS uses the GOFF binary format.
+  bool isOSBinFormatGOFF() const { return getObjectFormat() == Triple::GOFF; }
 
   /// Tests whether the environment is MachO.
   bool isOSBinFormatMachO() const {
@@ -868,6 +864,12 @@ public:
   /// Merge target triples.
   std::string merge(const Triple &Other) const;
 
+  /// Some platforms have different minimum supported OS versions that
+  /// varies by the architecture specified in the triple. This function
+  /// returns the minimum supported OS version for this triple if one an exists,
+  /// or an invalid version tuple if this triple doesn't have one.
+  VersionTuple getMinimumSupportedOSVersion() const;
+
   /// @}
   /// @name Static helpers for IDs.
   /// @{
@@ -902,6 +904,10 @@ public:
   static ArchType getArchTypeForLLVMName(StringRef Str);
 
   /// @}
+
+  /// Returns a canonicalized OS version number for the specified OS.
+  static VersionTuple getCanonicalVersionForOS(OSType OSKind,
+                                               const VersionTuple &Version);
 };
 
 } // End llvm namespace

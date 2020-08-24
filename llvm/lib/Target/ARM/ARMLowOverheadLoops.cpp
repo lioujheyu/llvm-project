@@ -201,31 +201,52 @@ namespace {
     PredicatedMI *getDivergent() const { return Divergent; }
   };
 
+  struct Reduction {
+    MachineInstr *Init;
+    MachineInstr &Copy;
+    MachineInstr &Reduce;
+    MachineInstr &VPSEL;
+
+    Reduction(MachineInstr *Init, MachineInstr *Mov, MachineInstr *Add,
+              MachineInstr *Sel)
+      : Init(Init), Copy(*Mov), Reduce(*Add), VPSEL(*Sel) { }
+  };
+
   struct LowOverheadLoop {
 
     MachineLoop &ML;
+    MachineBasicBlock *Preheader = nullptr;
     MachineLoopInfo &MLI;
     ReachingDefAnalysis &RDA;
     const TargetRegisterInfo &TRI;
+    const ARMBaseInstrInfo &TII;
     MachineFunction *MF = nullptr;
     MachineInstr *InsertPt = nullptr;
     MachineInstr *Start = nullptr;
     MachineInstr *Dec = nullptr;
     MachineInstr *End = nullptr;
     MachineInstr *VCTP = nullptr;
+    MachineOperand TPNumElements;
     SmallPtrSet<MachineInstr*, 4> SecondaryVCTPs;
     VPTBlock *CurrentBlock = nullptr;
     SetVector<MachineInstr*> CurrentPredicate;
     SmallVector<VPTBlock, 4> VPTBlocks;
     SmallPtrSet<MachineInstr*, 4> ToRemove;
+    SmallVector<std::unique_ptr<Reduction>, 1> Reductions;
     SmallPtrSet<MachineInstr*, 4> BlockMasksToRecompute;
     bool Revert = false;
     bool CannotTailPredicate = false;
 
     LowOverheadLoop(MachineLoop &ML, MachineLoopInfo &MLI,
-                    ReachingDefAnalysis &RDA, const TargetRegisterInfo &TRI)
-      : ML(ML), MLI(MLI), RDA(RDA), TRI(TRI) {
+                    ReachingDefAnalysis &RDA, const TargetRegisterInfo &TRI,
+                    const ARMBaseInstrInfo &TII)
+        : ML(ML), MLI(MLI), RDA(RDA), TRI(TRI), TII(TII),
+          TPNumElements(MachineOperand::CreateImm(0)) {
       MF = ML.getHeader()->getParent();
+      if (auto *MBB = ML.getLoopPreheader())
+        Preheader = MBB;
+      else if (auto *MBB = MLI.findLoopPreheader(&ML, true))
+        Preheader = MBB;
     }
 
     // If this is an MVE instruction, check that we know how to use tail
@@ -249,9 +270,13 @@ namespace {
     // of elements to the loop start instruction.
     bool ValidateTailPredicate(MachineInstr *StartInsertPt);
 
+    // See whether the live-out instructions are a reduction that we can fixup
+    // later.
+    bool FindValidReduction(InstSet &LiveMIs, InstSet &LiveOutUsers);
+
     // Check that any values available outside of the loop will be the same
     // after tail predication conversion.
-    bool ValidateLiveOuts() const;
+    bool ValidateLiveOuts();
 
     // Is it safe to define LR with DLS/WLS?
     // LR can be defined if it is the operand to start, because it's the same
@@ -268,11 +293,10 @@ namespace {
 
     SmallVectorImpl<VPTBlock> &getVPTBlocks() { return VPTBlocks; }
 
-    // Return the loop iteration count, or the number of elements if we're tail
-    // predicating.
-    MachineOperand &getCount() {
-      return IsTailPredicationLegal() ?
-        VCTP->getOperand(1) : Start->getOperand(0);
+    // Return the operand for the loop start instruction. This will be the loop
+    // iteration count, or the number of elements if we're tail predicating.
+    MachineOperand &getLoopStartOperand() {
+      return IsTailPredicationLegal() ? TPNumElements : Start->getOperand(0);
     }
 
     unsigned getStartOpcode() const {
@@ -340,6 +364,8 @@ namespace {
     void RevertLoopEnd(MachineInstr *MI, bool SkipCmp = false) const;
 
     void ConvertVPTBlocks(LowOverheadLoop &LoLoop);
+
+    void FixupReductions(LowOverheadLoop &LoLoop) const;
 
     MachineInstr *ExpandLoopStart(LowOverheadLoop &LoLoop);
 
@@ -428,7 +454,8 @@ bool LowOverheadLoop::ValidateTailPredicate(MachineInstr *StartInsertPt) {
   // of the iteration count, to the loop start instruction. The number of
   // elements is provided to the vctp instruction, so we need to check that
   // we can use this register at InsertPt.
-  Register NumElements = VCTP->getOperand(1).getReg();
+  TPNumElements = VCTP->getOperand(1);
+  Register NumElements = TPNumElements.getReg();
 
   // If the register is defined within loop, then we can't perform TP.
   // TODO: Check whether this is just a mov of a register that would be
@@ -441,9 +468,8 @@ bool LowOverheadLoop::ValidateTailPredicate(MachineInstr *StartInsertPt) {
   // The element count register maybe defined after InsertPt, in which case we
   // need to try to move either InsertPt or the def so that the [w|d]lstp can
   // use the value.
-  // TODO: On failing to move an instruction, check if the count is provided by
-  // a mov and whether we can use the mov operand directly.
   MachineBasicBlock *InsertBB = StartInsertPt->getParent();
+
   if (!RDA.isReachingDefLiveOut(StartInsertPt, NumElements)) {
     if (auto *ElemDef = RDA.getLocalLiveOutMIDef(InsertBB, NumElements)) {
       if (RDA.isSafeToMoveForwards(ElemDef, StartInsertPt)) {
@@ -457,9 +483,21 @@ bool LowOverheadLoop::ValidateTailPredicate(MachineInstr *StartInsertPt) {
                               StartInsertPt);
         LLVM_DEBUG(dbgs() << "ARM Loops: Moved start past: " << *ElemDef);
       } else {
-        LLVM_DEBUG(dbgs() << "ARM Loops: Unable to move element count to loop "
-                   << "start instruction.\n");
-        return false;
+        // If we fail to move an instruction and the element count is provided
+        // by a mov, use the mov operand if it will have the same value at the
+        // insertion point
+        MachineOperand Operand = ElemDef->getOperand(1);
+        if (isMovRegOpcode(ElemDef->getOpcode()) &&
+            RDA.getUniqueReachingMIDef(ElemDef, Operand.getReg()) ==
+                RDA.getUniqueReachingMIDef(StartInsertPt, Operand.getReg())) {
+          TPNumElements = Operand;
+          NumElements = TPNumElements.getReg();
+        } else {
+          LLVM_DEBUG(dbgs()
+                     << "ARM Loops: Unable to move element count to loop "
+                     << "start instruction.\n");
+          return false;
+        }
       }
     }
   }
@@ -481,7 +519,7 @@ bool LowOverheadLoop::ValidateTailPredicate(MachineInstr *StartInsertPt) {
   };
 
   // First, find the block that looks like the preheader.
-  MachineBasicBlock *MBB = MLI.findLoopPreheader(&ML, true);
+  MachineBasicBlock *MBB = Preheader;
   if (!MBB) {
     LLVM_DEBUG(dbgs() << "ARM Loops: Didn't find preheader.\n");
     return false;
@@ -626,7 +664,109 @@ static bool producesFalseLanesZero(MachineInstr &MI,
   return true;
 }
 
-bool LowOverheadLoop::ValidateLiveOuts() const {
+bool
+LowOverheadLoop::FindValidReduction(InstSet &LiveMIs, InstSet &LiveOutUsers) {
+  // Also check for reductions where the operation needs to be merging values
+  // from the last and previous loop iterations. This means an instruction
+  // producing a value and a vmov storing the value calculated in the previous
+  // iteration. So we can have two live-out regs, one produced by a vmov and
+  // both being consumed by a vpsel.
+  LLVM_DEBUG(dbgs() << "ARM Loops: Looking for reduction live-outs:\n";
+             for (auto *MI : LiveMIs)
+               dbgs() << " - " << *MI);
+
+  if (!Preheader)
+    return false;
+
+  // Expect a vmov, a vadd and a single vpsel user.
+  // TODO: This means we can't currently support multiple reductions in the
+  // loop.
+  if (LiveMIs.size() != 2 || LiveOutUsers.size() != 1)
+    return false;
+
+  MachineInstr *VPSEL = *LiveOutUsers.begin();
+  if (VPSEL->getOpcode() != ARM::MVE_VPSEL)
+    return false;
+
+  unsigned VPRIdx = llvm::findFirstVPTPredOperandIdx(*VPSEL) + 1;
+  MachineInstr *Pred = RDA.getMIOperand(VPSEL, VPRIdx);
+  if (!Pred || Pred != VCTP) {
+    LLVM_DEBUG(dbgs() << "ARM Loops: Not using equivalent predicate.\n");
+    return false;
+  }
+
+  MachineInstr *Reduce = RDA.getMIOperand(VPSEL, 1);
+  if (!Reduce)
+    return false;
+
+  assert(LiveMIs.count(Reduce) && "Expected MI to be live-out");
+
+  // TODO: Support more operations than VADD.
+  switch (VCTP->getOpcode()) {
+  default:
+    return false;
+  case ARM::MVE_VCTP8:
+    if (Reduce->getOpcode() != ARM::MVE_VADDi8)
+      return false;
+    break;
+  case ARM::MVE_VCTP16:
+    if (Reduce->getOpcode() != ARM::MVE_VADDi16)
+      return false;
+    break;
+  case ARM::MVE_VCTP32:
+    if (Reduce->getOpcode() != ARM::MVE_VADDi32)
+      return false;
+    break;
+  }
+
+  // Test that the reduce op is overwriting ones of its operands.
+  if (Reduce->getOperand(0).getReg() != Reduce->getOperand(1).getReg() &&
+      Reduce->getOperand(0).getReg() != Reduce->getOperand(2).getReg()) {
+    LLVM_DEBUG(dbgs() << "ARM Loops: Reducing op isn't overwriting itself.\n");
+    return false;
+  }
+
+  // Check that the VORR is actually a VMOV.
+  MachineInstr *Copy = RDA.getMIOperand(VPSEL, 2);
+  if (!Copy || Copy->getOpcode() != ARM::MVE_VORR ||
+      !Copy->getOperand(1).isReg() || !Copy->getOperand(2).isReg() ||
+      Copy->getOperand(1).getReg() != Copy->getOperand(2).getReg())
+    return false;
+
+  assert(LiveMIs.count(Copy) && "Expected MI to be live-out");
+
+  // Check that the vadd and vmov are only used by each other and the vpsel.
+  SmallPtrSet<MachineInstr*, 2> CopyUsers;
+  RDA.getGlobalUses(Copy, Copy->getOperand(0).getReg(), CopyUsers);
+  if (CopyUsers.size() > 2 || !CopyUsers.count(Reduce)) {
+    LLVM_DEBUG(dbgs() << "ARM Loops: Copy users unsupported.\n");
+    return false;
+  }
+
+  SmallPtrSet<MachineInstr*, 2> ReduceUsers;
+  RDA.getGlobalUses(Reduce, Reduce->getOperand(0).getReg(), ReduceUsers);
+  if (ReduceUsers.size() > 2 || !ReduceUsers.count(Copy)) {
+    LLVM_DEBUG(dbgs() << "ARM Loops: Reduce users unsupported.\n");
+    return false;
+  }
+
+  // Then find whether there's an instruction initialising the register that
+  // is storing the reduction.
+  SmallPtrSet<MachineInstr*, 2> Incoming;
+  RDA.getLiveOuts(Preheader, Copy->getOperand(1).getReg(), Incoming);
+  if (Incoming.size() > 1)
+    return false;
+
+  MachineInstr *Init = Incoming.empty() ? nullptr : *Incoming.begin();
+  LLVM_DEBUG(dbgs() << "ARM Loops: Found a reduction:\n"
+             << " - " << *Copy
+             << " - " << *Reduce
+             << " - " << *VPSEL);
+  Reductions.push_back(std::make_unique<Reduction>(Init, Copy, Reduce, VPSEL));
+  return true;
+}
+
+bool LowOverheadLoop::ValidateLiveOuts() {
   // We want to find out if the tail-predicated version of this loop will
   // produce the same values as the loop in its original form. For this to
   // be true, the newly inserted implicit predication must not change the
@@ -642,7 +782,7 @@ bool LowOverheadLoop::ValidateLiveOuts() const {
   // the false lanes are zeroed and here we're trying to track that those false
   // lanes remain zero, or where they change, the differences are masked away
   // by their user(s).
-  // All MVE loads and stores have to be predicated, so we know that any load
+  // All MVE stores have to be predicated, so we know that any predicate load
   // operands, or stored results are equivalent already. Other explicitly
   // predicated instructions will perform the same operation in the original
   // loop and the tail-predicated form too. Because of this, we can insert
@@ -652,9 +792,9 @@ bool LowOverheadLoop::ValidateLiveOuts() const {
   SetVector<MachineInstr *> FalseLanesUnknown;
   SmallPtrSet<MachineInstr *, 4> FalseLanesZero;
   SmallPtrSet<MachineInstr *, 4> Predicated;
-  MachineBasicBlock *MBB = ML.getHeader();
+  MachineBasicBlock *Header = ML.getHeader();
 
-  for (auto &MI : *MBB) {
+  for (auto &MI : *Header) {
     const MCInstrDesc &MCID = MI.getDesc();
     uint64_t Flags = MCID.TSFlags;
     if ((Flags & ARMII::DomainMask) != ARMII::DomainMVE)
@@ -702,6 +842,9 @@ bool LowOverheadLoop::ValidateLiveOuts() const {
   // stored and then we can work towards the leaves, hopefully adding more
   // instructions to Predicated. Successfully terminating the loop means that
   // all the unknown values have to found to be masked by predicated user(s).
+  // For any unpredicated values, we store them in NonPredicated so that we
+  // can later check whether these form a reduction.
+  SmallPtrSet<MachineInstr*, 2> NonPredicated;
   for (auto *MI : reverse(FalseLanesUnknown)) {
     for (auto &MO : MI->operands()) {
       if (!isRegInClass(MO, QPRs) || !MO.isDef())
@@ -709,39 +852,48 @@ bool LowOverheadLoop::ValidateLiveOuts() const {
       if (!HasPredicatedUsers(MI, MO, Predicated)) {
         LLVM_DEBUG(dbgs() << "ARM Loops: Found an unknown def of : "
                           << TRI.getRegAsmName(MO.getReg()) << " at " << *MI);
-        return false;
+        NonPredicated.insert(MI);
+        continue;
       }
     }
     // Any unknown false lanes have been masked away by the user(s).
     Predicated.insert(MI);
   }
 
-  // Collect Q-regs that are live in the exit blocks. We don't collect scalars
-  // because they won't be affected by lane predication.
-  SmallSet<Register, 2> LiveOuts;
+  SmallPtrSet<MachineInstr *, 2> LiveOutMIs;
+  SmallPtrSet<MachineInstr*, 2> LiveOutUsers;
   SmallVector<MachineBasicBlock *, 2> ExitBlocks;
   ML.getExitBlocks(ExitBlocks);
-  for (auto *MBB : ExitBlocks)
-    for (const MachineBasicBlock::RegisterMaskPair &RegMask : MBB->liveins())
-      if (QPRs->contains(RegMask.PhysReg))
-        LiveOuts.insert(RegMask.PhysReg);
-
-  // Collect the instructions in the loop body that define the live-out values.
-  SmallPtrSet<MachineInstr *, 2> LiveMIs;
   assert(ML.getNumBlocks() == 1 && "Expected single block loop!");
-  for (auto Reg : LiveOuts)
-    if (auto *MI = RDA.getLocalLiveOutMIDef(MBB, Reg))
-      LiveMIs.insert(MI);
+  assert(ExitBlocks.size() == 1 && "Expected a single exit block");
+  MachineBasicBlock *ExitBB = ExitBlocks.front();
+  for (const MachineBasicBlock::RegisterMaskPair &RegMask : ExitBB->liveins()) {
+    // Check Q-regs that are live in the exit blocks. We don't collect scalars
+    // because they won't be affected by lane predication.
+    if (QPRs->contains(RegMask.PhysReg)) {
+      if (auto *MI = RDA.getLocalLiveOutMIDef(Header, RegMask.PhysReg))
+        LiveOutMIs.insert(MI);
+      RDA.getLiveInUses(ExitBB, RegMask.PhysReg, LiveOutUsers);
+    }
+  }
 
-  LLVM_DEBUG(dbgs() << "ARM Loops: Found loop live-outs:\n";
-             for (auto *MI : LiveMIs)
-               dbgs() << " - " << *MI);
+  // If we have any non-predicated live-outs, they need to be part of a
+  // reduction that we can fixup later. The reduction that the form of an
+  // operation that uses its previous values through a vmov and then a vpsel
+  // resides in the exit blocks to select the final bytes from n and n-1
+  // iterations.
+  if (!NonPredicated.empty() &&
+      !FindValidReduction(NonPredicated, LiveOutUsers))
+    return false;
+
   // We've already validated that any VPT predication within the loop will be
   // equivalent when we perform the predication transformation; so we know that
   // any VPT predicated instruction is predicated upon VCTP. Any live-out
-  // instruction needs to be predicated, so check this here.
-  for (auto *MI : LiveMIs)
-    if (!isVectorPredicated(MI))
+  // instruction needs to be predicated, so check this here. The instructions
+  // in NonPredicated have been found to be a reduction that we can ensure its
+  // legality.
+  for (auto *MI : LiveOutMIs)
+    if (!isVectorPredicated(MI) && !NonPredicated.count(MI))
       return false;
 
   return true;
@@ -886,8 +1038,8 @@ bool LowOverheadLoop::ValidateMVEInst(MachineInstr* MI) {
   }
 
   // If the instruction is already explicitly predicated, then the conversion
-  // will be fine, but ensure that all memory operations are predicated.
-  return !IsUse && MI->mayLoadOrStore() ? false : true;
+  // will be fine, but ensure that all store operations are predicated.
+  return !IsUse && MI->mayStore() ? false : true;
 }
 
 bool ARMLowOverheadLoops::runOnMachineFunction(MachineFunction &mf) {
@@ -949,14 +1101,12 @@ bool ARMLowOverheadLoops::ProcessLoop(MachineLoop *ML) {
     return nullptr;
   };
 
-  LowOverheadLoop LoLoop(*ML, *MLI, *RDA, *TRI);
+  LowOverheadLoop LoLoop(*ML, *MLI, *RDA, *TRI, *TII);
   // Search the preheader for the start intrinsic.
   // FIXME: I don't see why we shouldn't be supporting multiple predecessors
   // with potentially multiple set.loop.iterations, so we need to enable this.
-  if (auto *Preheader = ML->getLoopPreheader())
-    LoLoop.Start = SearchForStart(Preheader);
-  else if (auto *Preheader = MLI->findLoopPreheader(ML, true))
-    LoLoop.Start = SearchForStart(Preheader);
+  if (LoLoop.Preheader)
+    LoLoop.Start = SearchForStart(LoLoop.Preheader);
   else
     return false;
 
@@ -1192,7 +1342,7 @@ MachineInstr* ARMLowOverheadLoops::ExpandLoopStart(LowOverheadLoop &LoLoop) {
   MachineBasicBlock *MBB = InsertPt->getParent();
   bool IsDo = Start->getOpcode() == ARM::t2DoLoopStart;
   unsigned Opc = LoLoop.getStartOpcode();
-  MachineOperand &Count = LoLoop.getCount();
+  MachineOperand &Count = LoLoop.getLoopStartOperand();
 
   MachineInstrBuilder MIB =
     BuildMI(*MBB, InsertPt, InsertPt->getDebugLoc(), TII->get(Opc));
@@ -1208,6 +1358,61 @@ MachineInstr* ARMLowOverheadLoops::ExpandLoopStart(LowOverheadLoop &LoLoop) {
   LoLoop.ToRemove.insert(Start);
   LLVM_DEBUG(dbgs() << "ARM Loops: Inserted start: " << *MIB);
   return &*MIB;
+}
+
+void ARMLowOverheadLoops::FixupReductions(LowOverheadLoop &LoLoop) const {
+  LLVM_DEBUG(dbgs() << "ARM Loops: Fixing up reduction(s).\n");
+  auto BuildMov = [this](MachineInstr &InsertPt, Register To, Register From) {
+    MachineBasicBlock *MBB = InsertPt.getParent();
+    MachineInstrBuilder MIB =
+      BuildMI(*MBB, &InsertPt, InsertPt.getDebugLoc(), TII->get(ARM::MVE_VORR));
+    MIB.addDef(To);
+    MIB.addReg(From);
+    MIB.addReg(From);
+    MIB.addImm(0);
+    MIB.addReg(0);
+    MIB.addReg(To);
+    LLVM_DEBUG(dbgs() << "ARM Loops: Inserted VMOV: " << *MIB);
+  };
+
+  for (auto &Reduction : LoLoop.Reductions) {
+    MachineInstr &Copy = Reduction->Copy;
+    MachineInstr &Reduce = Reduction->Reduce;
+    Register DestReg = Copy.getOperand(0).getReg();
+
+    // Change the initialiser if present
+    if (Reduction->Init) {
+      MachineInstr *Init = Reduction->Init;
+
+      for (unsigned i = 0; i < Init->getNumOperands(); ++i) {
+        MachineOperand &MO = Init->getOperand(i);
+        if (MO.isReg() && MO.isUse() && MO.isTied() &&
+            Init->findTiedOperandIdx(i) == 0)
+          Init->getOperand(i).setReg(DestReg);
+      }
+      Init->getOperand(0).setReg(DestReg);
+      LLVM_DEBUG(dbgs() << "ARM Loops: Changed init regs: " << *Init);
+    } else
+      BuildMov(LoLoop.Preheader->instr_back(), DestReg, Copy.getOperand(1).getReg());
+
+    // Change the reducing op to write to the register that is used to copy
+    // its value on the next iteration. Also update the tied-def operand.
+    Reduce.getOperand(0).setReg(DestReg);
+    Reduce.getOperand(5).setReg(DestReg);
+    LLVM_DEBUG(dbgs() << "ARM Loops: Changed reduction regs: " << Reduce);
+
+    // Instead of a vpsel, just copy the register into the necessary one.
+    MachineInstr &VPSEL = Reduction->VPSEL;
+    if (VPSEL.getOperand(0).getReg() != DestReg)
+      BuildMov(VPSEL, VPSEL.getOperand(0).getReg(), DestReg);
+
+    // Remove the unnecessary instructions.
+    LLVM_DEBUG(dbgs() << "ARM Loops: Removing:\n"
+               << " - " << Copy
+               << " - " << VPSEL << "\n");
+    Copy.eraseFromParent();
+    VPSEL.eraseFromParent();
+  }
 }
 
 void ARMLowOverheadLoops::ConvertVPTBlocks(LowOverheadLoop &LoLoop) {
@@ -1363,8 +1568,10 @@ void ARMLowOverheadLoops::Expand(LowOverheadLoop &LoLoop) {
     RemoveDeadBranch(LoLoop.Start);
     LoLoop.End = ExpandLoopEnd(LoLoop);
     RemoveDeadBranch(LoLoop.End);
-    if (LoLoop.IsTailPredicationLegal())
+    if (LoLoop.IsTailPredicationLegal()) {
       ConvertVPTBlocks(LoLoop);
+      FixupReductions(LoLoop);
+    }
     for (auto *I : LoLoop.ToRemove) {
       LLVM_DEBUG(dbgs() << "ARM Loops: Erasing " << *I);
       I->eraseFromParent();

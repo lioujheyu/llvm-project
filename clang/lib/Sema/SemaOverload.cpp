@@ -346,7 +346,6 @@ NarrowingKind StandardConversionSequence::getNarrowingKind(
                ToType->isRealFloatingType()) {
       if (IgnoreFloatToIntegralConversion)
         return NK_Not_Narrowing;
-      llvm::APSInt IntConstantValue;
       const Expr *Initializer = IgnoreNarrowingConversion(Ctx, Converted);
       assert(Initializer && "Unknown conversion expression");
 
@@ -354,19 +353,20 @@ NarrowingKind StandardConversionSequence::getNarrowingKind(
       if (Initializer->isValueDependent())
         return NK_Dependent_Narrowing;
 
-      if (Initializer->isIntegerConstantExpr(IntConstantValue, Ctx)) {
+      if (Optional<llvm::APSInt> IntConstantValue =
+              Initializer->getIntegerConstantExpr(Ctx)) {
         // Convert the integer to the floating type.
         llvm::APFloat Result(Ctx.getFloatTypeSemantics(ToType));
-        Result.convertFromAPInt(IntConstantValue, IntConstantValue.isSigned(),
+        Result.convertFromAPInt(*IntConstantValue, IntConstantValue->isSigned(),
                                 llvm::APFloat::rmNearestTiesToEven);
         // And back.
-        llvm::APSInt ConvertedValue = IntConstantValue;
+        llvm::APSInt ConvertedValue = *IntConstantValue;
         bool ignored;
         Result.convertToInteger(ConvertedValue,
                                 llvm::APFloat::rmTowardZero, &ignored);
         // If the resulting value is different, this was a narrowing conversion.
-        if (IntConstantValue != ConvertedValue) {
-          ConstantValue = APValue(IntConstantValue);
+        if (*IntConstantValue != ConvertedValue) {
+          ConstantValue = APValue(*IntConstantValue);
           ConstantType = Initializer->getType();
           return NK_Constant_Narrowing;
         }
@@ -430,17 +430,18 @@ NarrowingKind StandardConversionSequence::getNarrowingKind(
         (FromWidth == ToWidth && FromSigned != ToSigned) ||
         (FromSigned && !ToSigned)) {
       // Not all values of FromType can be represented in ToType.
-      llvm::APSInt InitializerValue;
       const Expr *Initializer = IgnoreNarrowingConversion(Ctx, Converted);
 
       // If it's value-dependent, we can't tell whether it's narrowing.
       if (Initializer->isValueDependent())
         return NK_Dependent_Narrowing;
 
-      if (!Initializer->isIntegerConstantExpr(InitializerValue, Ctx)) {
+      Optional<llvm::APSInt> OptInitializerValue;
+      if (!(OptInitializerValue = Initializer->getIntegerConstantExpr(Ctx))) {
         // Such conversions on variables are always narrowing.
         return NK_Variable_Narrowing;
       }
+      llvm::APSInt &InitializerValue = *OptInitializerValue;
       bool Narrowing = false;
       if (FromWidth < ToWidth) {
         // Negative -> unsigned is narrowing. Otherwise, more bits is never
@@ -2183,21 +2184,22 @@ bool Sema::IsIntegralPromotion(Expr *From, QualType FromType, QualType ToType) {
   // compatibility.
   if (From) {
     if (FieldDecl *MemberDecl = From->getSourceBitField()) {
-      llvm::APSInt BitWidth;
+      Optional<llvm::APSInt> BitWidth;
       if (FromType->isIntegralType(Context) &&
-          MemberDecl->getBitWidth()->isIntegerConstantExpr(BitWidth, Context)) {
-        llvm::APSInt ToSize(BitWidth.getBitWidth(), BitWidth.isUnsigned());
+          (BitWidth =
+               MemberDecl->getBitWidth()->getIntegerConstantExpr(Context))) {
+        llvm::APSInt ToSize(BitWidth->getBitWidth(), BitWidth->isUnsigned());
         ToSize = Context.getTypeSize(ToType);
 
         // Are we promoting to an int from a bitfield that fits in an int?
-        if (BitWidth < ToSize ||
-            (FromType->isSignedIntegerType() && BitWidth <= ToSize)) {
+        if (*BitWidth < ToSize ||
+            (FromType->isSignedIntegerType() && *BitWidth <= ToSize)) {
           return To->getKind() == BuiltinType::Int;
         }
 
         // Are we promoting to an unsigned int from an unsigned bitfield
         // that fits into an unsigned int?
-        if (FromType->isUnsignedIntegerType() && BitWidth <= ToSize) {
+        if (FromType->isUnsignedIntegerType() && *BitWidth <= ToSize) {
           return To->getKind() == BuiltinType::UInt;
         }
 
@@ -4709,7 +4711,7 @@ TryReferenceInit(Sema &S, Expr *Init, QualType DeclType,
                               Sema::ReferenceConversions::NestedQualification)
                              ? ICK_Qualification
                              : ICK_Identity;
-    ICS.Standard.FromTypePtr = T2.getAsOpaquePtr();
+    ICS.Standard.setFromType(T2);
     ICS.Standard.setToType(0, T2);
     ICS.Standard.setToType(1, T1);
     ICS.Standard.setToType(2, T1);
@@ -5626,6 +5628,7 @@ static ExprResult CheckConvertedConstantExpression(Sema &S, Expr *From,
     return Result;
 
   // Check for a narrowing implicit conversion.
+  bool ReturnPreNarrowingValue = false;
   APValue PreNarrowingValue;
   QualType PreNarrowingType;
   switch (SCS->getNarrowingKind(S.Context, Result.get(), PreNarrowingValue,
@@ -5640,12 +5643,22 @@ static ExprResult CheckConvertedConstantExpression(Sema &S, Expr *From,
     break;
 
   case NK_Constant_Narrowing:
+    if (CCE == Sema::CCEK_ArrayBound &&
+        PreNarrowingType->isIntegralOrEnumerationType() &&
+        PreNarrowingValue.isInt()) {
+      // Don't diagnose array bound narrowing here; we produce more precise
+      // errors by allowing the un-narrowed value through.
+      ReturnPreNarrowingValue = true;
+      break;
+    }
     S.Diag(From->getBeginLoc(), diag::ext_cce_narrowing)
         << CCE << /*Constant*/ 1
         << PreNarrowingValue.getAsString(S.Context, PreNarrowingType) << T;
     break;
 
   case NK_Type_Narrowing:
+    // FIXME: It would be better to diagnose that the expression is not a
+    // constant expression.
     S.Diag(From->getBeginLoc(), diag::ext_cce_narrowing)
         << CCE << /*Constant*/ 0 << From->getType() << T;
     break;
@@ -5674,7 +5687,10 @@ static ExprResult CheckConvertedConstantExpression(Sema &S, Expr *From,
 
     if (Notes.empty()) {
       // It's a constant expression.
-      return ConstantExpr::Create(S.Context, Result.get(), Value);
+      Expr *E = ConstantExpr::Create(S.Context, Result.get(), Value);
+      if (ReturnPreNarrowingValue)
+        Value = std::move(PreNarrowingValue);
+      return E;
     }
   }
 
@@ -9508,66 +9524,6 @@ bool clang::isBetterOverloadCandidate(
   else if (!Cand1.Viable)
     return false;
 
-  // [CUDA] A function with 'never' preference is marked not viable, therefore
-  // is never shown up here. The worst preference shown up here is 'wrong side',
-  // e.g. a host function called by a device host function in device
-  // compilation. This is valid AST as long as the host device function is not
-  // emitted, e.g. it is an inline function which is called only by a host
-  // function. A deferred diagnostic will be triggered if it is emitted.
-  // However a wrong-sided function is still a viable candidate here.
-  //
-  // If Cand1 can be emitted and Cand2 cannot be emitted in the current
-  // context, Cand1 is better than Cand2. If Cand1 can not be emitted and Cand2
-  // can be emitted, Cand1 is not better than Cand2. This rule should have
-  // precedence over other rules.
-  //
-  // If both Cand1 and Cand2 can be emitted, or neither can be emitted, then
-  // other rules should be used to determine which is better. This is because
-  // host/device based overloading resolution is mostly for determining
-  // viability of a function. If two functions are both viable, other factors
-  // should take precedence in preference, e.g. the standard-defined preferences
-  // like argument conversion ranks or enable_if partial-ordering. The
-  // preference for pass-object-size parameters is probably most similar to a
-  // type-based-overloading decision and so should take priority.
-  //
-  // If other rules cannot determine which is better, CUDA preference will be
-  // used again to determine which is better.
-  //
-  // TODO: Currently IdentifyCUDAPreference does not return correct values
-  // for functions called in global variable initializers due to missing
-  // correct context about device/host. Therefore we can only enforce this
-  // rule when there is a caller. We should enforce this rule for functions
-  // in global variable initializers once proper context is added.
-  if (S.getLangOpts().CUDA && Cand1.Function && Cand2.Function) {
-    if (FunctionDecl *Caller = dyn_cast<FunctionDecl>(S.CurContext)) {
-      bool IsCallerImplicitHD = Sema::IsCUDAImplicitHostDeviceFunction(Caller);
-      bool IsCand1ImplicitHD =
-          Sema::IsCUDAImplicitHostDeviceFunction(Cand1.Function);
-      bool IsCand2ImplicitHD =
-          Sema::IsCUDAImplicitHostDeviceFunction(Cand2.Function);
-      auto P1 = S.IdentifyCUDAPreference(Caller, Cand1.Function);
-      auto P2 = S.IdentifyCUDAPreference(Caller, Cand2.Function);
-      assert(P1 != Sema::CFP_Never && P2 != Sema::CFP_Never);
-      // The implicit HD function may be a function in a system header which
-      // is forced by pragma. In device compilation, if we prefer HD candidates
-      // over wrong-sided candidates, overloading resolution may change, which
-      // may result in non-deferrable diagnostics. As a workaround, we let
-      // implicit HD candidates take equal preference as wrong-sided candidates.
-      // This will preserve the overloading resolution.
-      auto EmitThreshold =
-          (S.getLangOpts().CUDAIsDevice && IsCallerImplicitHD &&
-           (IsCand1ImplicitHD || IsCand2ImplicitHD))
-              ? Sema::CFP_Never
-              : Sema::CFP_WrongSide;
-      auto Cand1Emittable = P1 > EmitThreshold;
-      auto Cand2Emittable = P2 > EmitThreshold;
-      if (Cand1Emittable && !Cand2Emittable)
-        return true;
-      if (!Cand1Emittable && Cand2Emittable)
-        return false;
-    }
-  }
-
   // C++ [over.match.best]p1:
   //
   //   -- if F is a static member function, ICS1(F) is defined such
@@ -9802,6 +9758,12 @@ bool clang::isBetterOverloadCandidate(
       return Cmp == Comparison::Better;
   }
 
+  if (S.getLangOpts().CUDA && Cand1.Function && Cand2.Function) {
+    FunctionDecl *Caller = dyn_cast<FunctionDecl>(S.CurContext);
+    return S.IdentifyCUDAPreference(Caller, Cand1.Function) >
+           S.IdentifyCUDAPreference(Caller, Cand2.Function);
+  }
+
   bool HasPS1 = Cand1.Function != nullptr &&
                 functionHasPassObjectSizeParams(Cand1.Function);
   bool HasPS2 = Cand2.Function != nullptr &&
@@ -9809,21 +9771,8 @@ bool clang::isBetterOverloadCandidate(
   if (HasPS1 != HasPS2 && HasPS1)
     return true;
 
-  auto MV = isBetterMultiversionCandidate(Cand1, Cand2);
-  if (MV == Comparison::Better)
-    return true;
-  if (MV == Comparison::Worse)
-    return false;
-
-  // If other rules cannot determine which is better, CUDA preference is used
-  // to determine which is better.
-  if (S.getLangOpts().CUDA && Cand1.Function && Cand2.Function) {
-    FunctionDecl *Caller = dyn_cast<FunctionDecl>(S.CurContext);
-    return S.IdentifyCUDAPreference(Caller, Cand1.Function) >
-           S.IdentifyCUDAPreference(Caller, Cand2.Function);
-  }
-
-  return false;
+  Comparison MV = isBetterMultiversionCandidate(Cand1, Cand2);
+  return MV == Comparison::Better;
 }
 
 /// Determine whether two declarations are "equivalent" for the purposes of
@@ -9908,6 +9857,33 @@ OverloadCandidateSet::BestViableFunction(Sema &S, SourceLocation Loc,
   llvm::SmallVector<OverloadCandidate *, 16> Candidates;
   std::transform(begin(), end(), std::back_inserter(Candidates),
                  [](OverloadCandidate &Cand) { return &Cand; });
+
+  // [CUDA] HD->H or HD->D calls are technically not allowed by CUDA but
+  // are accepted by both clang and NVCC. However, during a particular
+  // compilation mode only one call variant is viable. We need to
+  // exclude non-viable overload candidates from consideration based
+  // only on their host/device attributes. Specifically, if one
+  // candidate call is WrongSide and the other is SameSide, we ignore
+  // the WrongSide candidate.
+  if (S.getLangOpts().CUDA) {
+    const FunctionDecl *Caller = dyn_cast<FunctionDecl>(S.CurContext);
+    bool ContainsSameSideCandidate =
+        llvm::any_of(Candidates, [&](OverloadCandidate *Cand) {
+          // Check viable function only.
+          return Cand->Viable && Cand->Function &&
+                 S.IdentifyCUDAPreference(Caller, Cand->Function) ==
+                     Sema::CFP_SameSide;
+        });
+    if (ContainsSameSideCandidate) {
+      auto IsWrongSideCandidate = [&](OverloadCandidate *Cand) {
+        // Check viable function only to avoid unnecessary data copying/moving.
+        return Cand->Viable && Cand->Function &&
+               S.IdentifyCUDAPreference(Caller, Cand->Function) ==
+                   Sema::CFP_WrongSide;
+      };
+      llvm::erase_if(Candidates, IsWrongSideCandidate);
+    }
+  }
 
   // Find the best viable function.
   Best = end();
@@ -12835,8 +12811,9 @@ bool Sema::buildOverloadedCallSet(Scope *S, Expr *Fn,
       // then create a type dependent CallExpr. The goal is to postpone name
       // lookup to instantiation time to be able to search into type dependent
       // base classes.
-      CallExpr *CE = CallExpr::Create(Context, Fn, Args, Context.DependentTy,
-                                      VK_RValue, RParenLoc);
+      CallExpr *CE =
+          CallExpr::Create(Context, Fn, Args, Context.DependentTy, VK_RValue,
+                           RParenLoc, CurFPFeatureOverrides());
       CE->markDependentForPostponedNameLookup();
       *Result = CE;
       return true;
@@ -12858,7 +12835,9 @@ static QualType chooseRecoveryType(OverloadCandidateSet &CS,
   auto ConsiderCandidate = [&](const OverloadCandidate &Candidate) {
     if (!Candidate.Function)
       return;
-    QualType T = Candidate.Function->getCallResultType();
+    if (Candidate.Function->isInvalidDecl())
+      return;
+    QualType T = Candidate.Function->getReturnType();
     if (T.isNull())
       return;
     if (!Result)
@@ -13031,7 +13010,18 @@ ExprResult Sema::BuildOverloadedCallExpr(Scope *S, Expr *Fn,
 
 static bool IsOverloaded(const UnresolvedSetImpl &Functions) {
   return Functions.size() > 1 ||
-    (Functions.size() == 1 && isa<FunctionTemplateDecl>(*Functions.begin()));
+         (Functions.size() == 1 &&
+          isa<FunctionTemplateDecl>((*Functions.begin())->getUnderlyingDecl()));
+}
+
+ExprResult Sema::CreateUnresolvedLookupExpr(CXXRecordDecl *NamingClass,
+                                            NestedNameSpecifierLoc NNSLoc,
+                                            DeclarationNameInfo DNI,
+                                            const UnresolvedSetImpl &Fns,
+                                            bool PerformADL) {
+  return UnresolvedLookupExpr::Create(Context, NamingClass, NNSLoc, DNI,
+                                      PerformADL, IsOverloaded(Fns),
+                                      Fns.begin(), Fns.end());
 }
 
 /// Create a unary operation that may resolve to an overloaded
@@ -13081,15 +13071,16 @@ Sema::CreateOverloadedUnaryOp(SourceLocation OpLoc, UnaryOperatorKind Opc,
     if (Fns.empty())
       return UnaryOperator::Create(Context, Input, Opc, Context.DependentTy,
                                    VK_RValue, OK_Ordinary, OpLoc, false,
-                                   CurFPFeatures);
+                                   CurFPFeatureOverrides());
 
     CXXRecordDecl *NamingClass = nullptr; // lookup ignores member operators
-    UnresolvedLookupExpr *Fn = UnresolvedLookupExpr::Create(
-        Context, NamingClass, NestedNameSpecifierLoc(), OpNameInfo,
-        /*ADL*/ true, IsOverloaded(Fns), Fns.begin(), Fns.end());
-    return CXXOperatorCallExpr::Create(Context, Op, Fn, ArgsArray,
+    ExprResult Fn = CreateUnresolvedLookupExpr(
+        NamingClass, NestedNameSpecifierLoc(), OpNameInfo, Fns);
+    if (Fn.isInvalid())
+      return ExprError();
+    return CXXOperatorCallExpr::Create(Context, Op, Fn.get(), ArgsArray,
                                        Context.DependentTy, VK_RValue, OpLoc,
-                                       CurFPFeatures);
+                                       CurFPFeatureOverrides());
   }
 
   // Build an empty overload set.
@@ -13163,7 +13154,7 @@ Sema::CreateOverloadedUnaryOp(SourceLocation OpLoc, UnaryOperatorKind Opc,
       Args[0] = Input;
       CallExpr *TheCall = CXXOperatorCallExpr::Create(
           Context, Op, FnExpr.get(), ArgsArray, ResultTy, VK, OpLoc,
-          CurFPFeatures, Best->IsADLCandidate);
+          CurFPFeatureOverrides(), Best->IsADLCandidate);
 
       if (CheckCallReturnType(FnDecl->getReturnType(), OpLoc, TheCall, FnDecl))
         return ExprError();
@@ -13332,12 +13323,12 @@ ExprResult Sema::CreateOverloadedBinOp(SourceLocation OpLoc,
       // If there are no functions to store, just build a dependent
       // BinaryOperator or CompoundAssignment.
       if (Opc <= BO_Assign || Opc > BO_OrAssign)
-        return BinaryOperator::Create(Context, Args[0], Args[1], Opc,
-                                      Context.DependentTy, VK_RValue,
-                                      OK_Ordinary, OpLoc, CurFPFeatures);
+        return BinaryOperator::Create(
+            Context, Args[0], Args[1], Opc, Context.DependentTy, VK_RValue,
+            OK_Ordinary, OpLoc, CurFPFeatureOverrides());
       return CompoundAssignOperator::Create(
           Context, Args[0], Args[1], Opc, Context.DependentTy, VK_LValue,
-          OK_Ordinary, OpLoc, CurFPFeatures, Context.DependentTy,
+          OK_Ordinary, OpLoc, CurFPFeatureOverrides(), Context.DependentTy,
           Context.DependentTy);
     }
 
@@ -13346,12 +13337,13 @@ ExprResult Sema::CreateOverloadedBinOp(SourceLocation OpLoc,
     // TODO: provide better source location info in DNLoc component.
     DeclarationName OpName = Context.DeclarationNames.getCXXOperatorName(Op);
     DeclarationNameInfo OpNameInfo(OpName, OpLoc);
-    UnresolvedLookupExpr *Fn = UnresolvedLookupExpr::Create(
-        Context, NamingClass, NestedNameSpecifierLoc(), OpNameInfo,
-        /*ADL*/ PerformADL, IsOverloaded(Fns), Fns.begin(), Fns.end());
-    return CXXOperatorCallExpr::Create(Context, Op, Fn, Args,
+    ExprResult Fn = CreateUnresolvedLookupExpr(
+        NamingClass, NestedNameSpecifierLoc(), OpNameInfo, Fns, PerformADL);
+    if (Fn.isInvalid())
+      return ExprError();
+    return CXXOperatorCallExpr::Create(Context, Op, Fn.get(), Args,
                                        Context.DependentTy, VK_RValue, OpLoc,
-                                       CurFPFeatures);
+                                       CurFPFeatureOverrides());
   }
 
   // Always do placeholder-like conversions on the RHS.
@@ -13520,7 +13512,7 @@ ExprResult Sema::CreateOverloadedBinOp(SourceLocation OpLoc,
 
         CXXOperatorCallExpr *TheCall = CXXOperatorCallExpr::Create(
             Context, ChosenOp, FnExpr.get(), Args, ResultTy, VK, OpLoc,
-            CurFPFeatures, Best->IsADLCandidate);
+            CurFPFeatureOverrides(), Best->IsADLCandidate);
 
         if (CheckCallReturnType(FnDecl->getReturnType(), OpLoc, TheCall,
                                 FnDecl))
@@ -13543,6 +13535,10 @@ ExprResult Sema::CreateOverloadedBinOp(SourceLocation OpLoc,
                   VariadicDoesNotApply);
 
         ExprResult R = MaybeBindToTemporary(TheCall);
+        if (R.isInvalid())
+          return ExprError();
+
+        R = CheckForImmediateInvocation(R, FnDecl);
         if (R.isInvalid())
           return ExprError();
 
@@ -13581,7 +13577,7 @@ ExprResult Sema::CreateOverloadedBinOp(SourceLocation OpLoc,
         if (Best->RewriteKind != CRK_None)
           R = new (Context) CXXRewrittenBinaryOperator(R.get(), IsReversed);
 
-        return CheckForImmediateInvocation(R, FnDecl);
+        return R;
       } else {
         // We matched a built-in operator. Convert the arguments, then
         // break out so that we will build the appropriate built-in
@@ -13788,7 +13784,7 @@ ExprResult Sema::BuildSynthesizedThreeWayComparison(
   Expr *SyntacticForm = BinaryOperator::Create(
       Context, OrigLHS, OrigRHS, BO_Cmp, Result.get()->getType(),
       Result.get()->getValueKind(), Result.get()->getObjectKind(), OpLoc,
-      CurFPFeatures);
+      CurFPFeatureOverrides());
   Expr *SemanticForm[] = {LHS, RHS, Result.get()};
   return PseudoObjectExpr::Create(Context, SyntacticForm, SemanticForm, 2);
 }
@@ -13809,17 +13805,15 @@ Sema::CreateOverloadedArraySubscriptExpr(SourceLocation LLoc,
     // CHECKME: no 'operator' keyword?
     DeclarationNameInfo OpNameInfo(OpName, LLoc);
     OpNameInfo.setCXXOperatorNameRange(SourceRange(LLoc, RLoc));
-    UnresolvedLookupExpr *Fn
-      = UnresolvedLookupExpr::Create(Context, NamingClass,
-                                     NestedNameSpecifierLoc(), OpNameInfo,
-                                     /*ADL*/ true, /*Overloaded*/ false,
-                                     UnresolvedSetIterator(),
-                                     UnresolvedSetIterator());
+    ExprResult Fn = CreateUnresolvedLookupExpr(
+        NamingClass, NestedNameSpecifierLoc(), OpNameInfo, UnresolvedSet<0>());
+    if (Fn.isInvalid())
+      return ExprError();
     // Can't add any actual overloads yet
 
-    return CXXOperatorCallExpr::Create(Context, OO_Subscript, Fn, Args,
+    return CXXOperatorCallExpr::Create(Context, OO_Subscript, Fn.get(), Args,
                                        Context.DependentTy, VK_RValue, RLoc,
-                                       CurFPFeatures);
+                                       CurFPFeatureOverrides());
   }
 
   // Handle placeholders on both operands.
@@ -13892,9 +13886,9 @@ Sema::CreateOverloadedArraySubscriptExpr(SourceLocation LLoc,
         ExprValueKind VK = Expr::getValueKindForType(ResultTy);
         ResultTy = ResultTy.getNonLValueExprType(Context);
 
-        CXXOperatorCallExpr *TheCall =
-            CXXOperatorCallExpr::Create(Context, OO_Subscript, FnExpr.get(),
-                                        Args, ResultTy, VK, RLoc, CurFPFeatures);
+        CXXOperatorCallExpr *TheCall = CXXOperatorCallExpr::Create(
+            Context, OO_Subscript, FnExpr.get(), Args, ResultTy, VK, RLoc,
+            CurFPFeatureOverrides());
         if (CheckCallReturnType(FnDecl->getReturnType(), LLoc, TheCall, FnDecl))
           return ExprError();
 
@@ -14012,9 +14006,9 @@ Sema::BuildCallToMemberFunction(Scope *S, Expr *MemExprE,
         << (qualsString.find(' ') == std::string::npos ? 1 : 2);
     }
 
-    CXXMemberCallExpr *call =
-        CXXMemberCallExpr::Create(Context, MemExprE, Args, resultType,
-                                  valueKind, RParenLoc, proto->getNumParams());
+    CXXMemberCallExpr *call = CXXMemberCallExpr::Create(
+        Context, MemExprE, Args, resultType, valueKind, RParenLoc,
+        CurFPFeatureOverrides(), proto->getNumParams());
 
     if (CheckCallReturnType(proto->getReturnType(), op->getRHS()->getBeginLoc(),
                             call, nullptr))
@@ -14031,7 +14025,7 @@ Sema::BuildCallToMemberFunction(Scope *S, Expr *MemExprE,
 
   if (isa<CXXPseudoDestructorExpr>(NakedMemExpr))
     return CallExpr::Create(Context, MemExprE, Args, Context.VoidTy, VK_RValue,
-                            RParenLoc);
+                            RParenLoc, CurFPFeatureOverrides());
 
   UnbridgedCastsSet UnbridgedCasts;
   if (checkArgPlaceholdersForOverload(*this, Args, UnbridgedCasts))
@@ -14169,9 +14163,9 @@ Sema::BuildCallToMemberFunction(Scope *S, Expr *MemExprE,
 
   assert(Method && "Member call to something that isn't a method?");
   const auto *Proto = Method->getType()->castAs<FunctionProtoType>();
-  CXXMemberCallExpr *TheCall =
-      CXXMemberCallExpr::Create(Context, MemExprE, Args, ResultType, VK,
-                                RParenLoc, Proto->getNumParams());
+  CXXMemberCallExpr *TheCall = CXXMemberCallExpr::Create(
+      Context, MemExprE, Args, ResultType, VK, RParenLoc,
+      CurFPFeatureOverrides(), Proto->getNumParams());
 
   // Check for a valid return type.
   if (CheckCallReturnType(Method->getReturnType(), MemExpr->getMemberLoc(),
@@ -14226,12 +14220,12 @@ Sema::BuildCallToMemberFunction(Scope *S, Expr *MemExprE,
       Diag(MemExpr->getBeginLoc(),
            diag::warn_call_to_pure_virtual_member_function_from_ctor_dtor)
           << MD->getDeclName() << isa<CXXDestructorDecl>(CurContext)
-          << MD->getParent()->getDeclName();
+          << MD->getParent();
 
       Diag(MD->getBeginLoc(), diag::note_previous_decl) << MD->getDeclName();
       if (getLangOpts().AppleKext)
         Diag(MemExpr->getBeginLoc(), diag::note_pure_qualified_call_kext)
-            << MD->getParent()->getDeclName() << MD->getDeclName();
+            << MD->getParent() << MD->getDeclName();
     }
   }
 
@@ -14516,9 +14510,9 @@ Sema::BuildCallToObjectOfClassType(Scope *S, Expr *Obj,
   ExprValueKind VK = Expr::getValueKindForType(ResultTy);
   ResultTy = ResultTy.getNonLValueExprType(Context);
 
-  CXXOperatorCallExpr *TheCall =
-      CXXOperatorCallExpr::Create(Context, OO_Call, NewFn.get(), MethodArgs,
-                                  ResultTy, VK, RParenLoc, CurFPFeatures);
+  CXXOperatorCallExpr *TheCall = CXXOperatorCallExpr::Create(
+      Context, OO_Call, NewFn.get(), MethodArgs, ResultTy, VK, RParenLoc,
+      CurFPFeatureOverrides());
 
   if (CheckCallReturnType(Method->getReturnType(), LParenLoc, TheCall, Method))
     return true;
@@ -14634,8 +14628,9 @@ Sema::BuildOverloadedArrowExpr(Scope *S, Expr *Base, SourceLocation OpLoc,
   QualType ResultTy = Method->getReturnType();
   ExprValueKind VK = Expr::getValueKindForType(ResultTy);
   ResultTy = ResultTy.getNonLValueExprType(Context);
-  CXXOperatorCallExpr *TheCall = CXXOperatorCallExpr::Create(
-      Context, OO_Arrow, FnExpr.get(), Base, ResultTy, VK, OpLoc, CurFPFeatures);
+  CXXOperatorCallExpr *TheCall =
+      CXXOperatorCallExpr::Create(Context, OO_Arrow, FnExpr.get(), Base,
+                                  ResultTy, VK, OpLoc, CurFPFeatureOverrides());
 
   if (CheckCallReturnType(Method->getReturnType(), OpLoc, TheCall, Method))
     return ExprError();
@@ -14713,7 +14708,7 @@ ExprResult Sema::BuildLiteralOperatorCall(LookupResult &R,
 
   UserDefinedLiteral *UDL = UserDefinedLiteral::Create(
       Context, Fn.get(), llvm::makeArrayRef(ConvArgs, Args.size()), ResultTy,
-      VK, LitEndLoc, UDSuffixLoc);
+      VK, LitEndLoc, UDSuffixLoc, CurFPFeatureOverrides());
 
   if (CheckCallReturnType(FD->getReturnType(), UDSuffixLoc, UDL, FD))
     return ExprError();
@@ -14759,12 +14754,12 @@ Sema::BuildForRangeBeginEndCall(SourceLocation Loc,
       return FRS_DiagnosticIssued;
     }
   } else {
-    UnresolvedSet<0> FoundNames;
-    UnresolvedLookupExpr *Fn =
-      UnresolvedLookupExpr::Create(Context, /*NamingClass=*/nullptr,
-                                   NestedNameSpecifierLoc(), NameInfo,
-                                   /*NeedsADL=*/true, /*Overloaded=*/false,
-                                   FoundNames.begin(), FoundNames.end());
+    ExprResult FnR = CreateUnresolvedLookupExpr(/*NamingClass=*/nullptr,
+                                                NestedNameSpecifierLoc(),
+                                                NameInfo, UnresolvedSet<0>());
+    if (FnR.isInvalid())
+      return FRS_DiagnosticIssued;
+    UnresolvedLookupExpr *Fn = cast<UnresolvedLookupExpr>(FnR.get());
 
     bool CandidateSetError = buildOverloadedCallSet(S, Fn, Fn, Range, Loc,
                                                     CandidateSet, CallExpr);
@@ -14884,7 +14879,7 @@ Expr *Sema::FixOverloadedFunctionReference(Expr *E, DeclAccessPair Found,
 
         return UnaryOperator::Create(
             Context, SubExpr, UO_AddrOf, MemPtrType, VK_RValue, OK_Ordinary,
-            UnOp->getOperatorLoc(), false, CurFPFeatures);
+            UnOp->getOperatorLoc(), false, CurFPFeatureOverrides());
       }
     }
     Expr *SubExpr = FixOverloadedFunctionReference(UnOp->getSubExpr(),
@@ -14892,9 +14887,10 @@ Expr *Sema::FixOverloadedFunctionReference(Expr *E, DeclAccessPair Found,
     if (SubExpr == UnOp->getSubExpr())
       return UnOp;
 
-    return UnaryOperator::Create(
-        Context, SubExpr, UO_AddrOf, Context.getPointerType(SubExpr->getType()),
-        VK_RValue, OK_Ordinary, UnOp->getOperatorLoc(), false, CurFPFeatures);
+    return UnaryOperator::Create(Context, SubExpr, UO_AddrOf,
+                                 Context.getPointerType(SubExpr->getType()),
+                                 VK_RValue, OK_Ordinary, UnOp->getOperatorLoc(),
+                                 false, CurFPFeatureOverrides());
   }
 
   if (UnresolvedLookupExpr *ULE = dyn_cast<UnresolvedLookupExpr>(E)) {

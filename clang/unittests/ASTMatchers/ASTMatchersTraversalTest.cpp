@@ -2637,6 +2637,19 @@ TEST(Has, DoesNotDeleteBindings) {
     std::make_unique<VerifyIdIsBoundTo<Decl>>("x", 1)));
 }
 
+TEST(TemplateArgumentLoc, Matches) {
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      R"cpp(
+        template <typename A, int B, template <typename> class C> class X {};
+        class A {};
+        const int B = 42;
+        template <typename> class C {};
+        X<A, B, C> x;
+      )cpp",
+      templateArgumentLoc().bind("x"),
+      std::make_unique<VerifyIdIsBoundTo<TemplateArgumentLoc>>("x", 3)));
+}
+
 TEST(LoopingMatchers, DoNotOverwritePreviousMatchResultOnFailure) {
   // Those matchers cover all the cases where an inner matcher is called
   // and there is not a 1:1 relationship between the match of the outer
@@ -2864,6 +2877,34 @@ TEST(HasParent, MatchesOnlyParent) {
     compoundStmt(hasParent(ifStmt()))));
 }
 
+TEST(MatcherMemoize, HasParentDiffersFromHas) {
+  // Test introduced after detecting a bug in memoization
+  constexpr auto code = "void f() { throw 1; }";
+  EXPECT_TRUE(notMatches(
+    code,
+    cxxThrowExpr(hasParent(expr()))));
+  EXPECT_TRUE(matches(
+    code,
+    cxxThrowExpr(has(expr()))));
+  EXPECT_TRUE(matches(
+    code,
+    cxxThrowExpr(anyOf(hasParent(expr()), has(expr())))));
+}
+
+TEST(MatcherMemoize, HasDiffersFromHasDescendant) {
+  // Test introduced after detecting a bug in memoization
+  constexpr auto code = "void f() { throw 1+1; }";
+  EXPECT_TRUE(notMatches(
+    code,
+    cxxThrowExpr(has(integerLiteral()))));
+  EXPECT_TRUE(matches(
+    code,
+    cxxThrowExpr(hasDescendant(integerLiteral()))));
+  EXPECT_TRUE(notMatches(code, 
+    cxxThrowExpr(allOf(
+      hasDescendant(integerLiteral()),
+      has(integerLiteral())))));
+}
 TEST(HasAncestor, MatchesAllAncestors) {
   EXPECT_TRUE(matches(
     "template <typename T> struct C { static void f() { 42; } };"

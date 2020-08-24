@@ -84,6 +84,9 @@ private:
   bool moveScalarAddSub(SetVectorType &Worklist, MachineInstr &Inst,
                         MachineDominatorTree *MDT = nullptr) const;
 
+  void lowerSelect(SetVectorType &Worklist, MachineInstr &Inst,
+                   MachineDominatorTree *MDT = nullptr) const;
+
   void lowerScalarAbs(SetVectorType &Worklist,
                       MachineInstr &Inst) const;
 
@@ -674,7 +677,7 @@ public:
 
   bool isVGPRCopy(const MachineInstr &MI) const {
     assert(MI.isCopy());
-    unsigned Dest = MI.getOperand(0).getReg();
+    Register Dest = MI.getOperand(0).getReg();
     const MachineFunction &MF = *MI.getParent()->getParent();
     const MachineRegisterInfo &MRI = MF.getRegInfo();
     return !RI.isSGPRReg(MRI, Dest);
@@ -880,6 +883,7 @@ public:
                               MachineRegisterInfo &MRI) const;
 
   void legalizeOperandsSMRD(MachineRegisterInfo &MRI, MachineInstr &MI) const;
+  void legalizeOperandsFLAT(MachineRegisterInfo &MRI, MachineInstr &MI) const;
 
   void legalizeGenericOperand(MachineBasicBlock &InsertMBB,
                               MachineBasicBlock::iterator I,
@@ -1050,6 +1054,8 @@ public:
   unsigned getInstrLatency(const InstrItineraryData *ItinData,
                            const MachineInstr &MI,
                            unsigned *PredCost = nullptr) const override;
+
+  static unsigned getDSShaderTypeValue(const MachineFunction &MF);
 };
 
 /// \brief Returns true if a reg:subreg pair P has a TRC class

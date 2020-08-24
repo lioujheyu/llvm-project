@@ -105,19 +105,23 @@ public:
     Register SrcReg = lookThroughCopyInstrs(MI.getOperand(1).getReg());
 
     // zext(trunc x) - > and (aext/copy/trunc x), mask
+    // zext(sext x) -> and (sext x), mask
     Register TruncSrc;
-    if (mi_match(SrcReg, MRI, m_GTrunc(m_Reg(TruncSrc)))) {
+    Register SextSrc;
+    if (mi_match(SrcReg, MRI, m_GTrunc(m_Reg(TruncSrc))) ||
+        mi_match(SrcReg, MRI, m_GSExt(m_Reg(SextSrc)))) {
       LLT DstTy = MRI.getType(DstReg);
       if (isInstUnsupported({TargetOpcode::G_AND, {DstTy}}) ||
           isConstantUnsupported(DstTy))
         return false;
       LLVM_DEBUG(dbgs() << ".. Combine MI: " << MI;);
       LLT SrcTy = MRI.getType(SrcReg);
-      APInt Mask = APInt::getAllOnesValue(SrcTy.getScalarSizeInBits());
-      auto MIBMask = Builder.buildConstant(
-        DstTy, Mask.zext(DstTy.getScalarSizeInBits()));
-      Builder.buildAnd(DstReg, Builder.buildAnyExtOrTrunc(DstTy, TruncSrc),
-                       MIBMask);
+      APInt MaskVal = APInt::getAllOnesValue(SrcTy.getScalarSizeInBits());
+      auto Mask = Builder.buildConstant(
+        DstTy, MaskVal.zext(DstTy.getScalarSizeInBits()));
+      auto Extended = SextSrc ? Builder.buildSExtOrTrunc(DstTy, SextSrc) :
+                                Builder.buildAnyExtOrTrunc(DstTy, TruncSrc);
+      Builder.buildAnd(DstReg, Extended, Mask);
       markInstAndDefDead(MI, *MRI.getVRegDef(SrcReg), DeadInsts);
       return true;
     }
@@ -263,7 +267,7 @@ public:
         const unsigned NumSrcs = DstSize / MergeSrcSize;
         assert(NumSrcs < SrcMI->getNumOperands() - 1 &&
                "trunc(merge) should require less inputs than merge");
-        SmallVector<Register, 2> SrcRegs(NumSrcs);
+        SmallVector<Register, 8> SrcRegs(NumSrcs);
         for (unsigned i = 0; i < NumSrcs; ++i)
           SrcRegs[i] = SrcMI->getOperand(i + 1).getReg();
 
@@ -375,9 +379,11 @@ public:
         Builder.setInstr(MI);
         auto NewUnmerge = Builder.buildUnmerge(UnmergeTy, CastSrcReg);
 
-        SmallVector<Register, 8> Regs(NumDefs);
-        for (unsigned I = 0; I != NumDefs; ++I)
-          Builder.buildTrunc(MI.getOperand(I), NewUnmerge.getReg(I));
+        for (unsigned I = 0; I != NumDefs; ++I) {
+          Register DefReg = MI.getOperand(I).getReg();
+          UpdatedDefs.push_back(DefReg);
+          Builder.buildTrunc(DefReg, NewUnmerge.getReg(I));
+        }
 
         markInstAndDefDead(MI, CastMI, DeadInsts);
         return true;
@@ -402,7 +408,7 @@ public:
         // Gather the original destination registers and create new ones for the
         // unused bits
         const unsigned NewNumDefs = CastSrcSize / DestSize;
-        SmallVector<Register, 2> DstRegs(NewNumDefs);
+        SmallVector<Register, 8> DstRegs(NewNumDefs);
         for (unsigned Idx = 0; Idx < NewNumDefs; ++Idx) {
           if (Idx < NumDefs)
             DstRegs[Idx] = MI.getOperand(Idx).getReg();
@@ -413,7 +419,7 @@ public:
         // Build new unmerge
         Builder.setInstr(MI);
         Builder.buildUnmerge(DstRegs, CastSrcReg);
-        UpdatedDefs.append(DstRegs.begin(), DstRegs.begin() + NumDefs);
+        UpdatedDefs.append(DstRegs.begin(), DstRegs.begin() + NewNumDefs);
         markInstAndDefDead(MI, CastMI, DeadInsts);
         return true;
       }
@@ -547,7 +553,7 @@ public:
 
       const unsigned NewNumDefs = NumDefs / NumMergeRegs;
       for (unsigned Idx = 0; Idx < NumMergeRegs; ++Idx) {
-        SmallVector<Register, 2> DstRegs;
+        SmallVector<Register, 8> DstRegs;
         for (unsigned j = 0, DefIdx = Idx * NewNumDefs; j < NewNumDefs;
              ++j, ++DefIdx)
           DstRegs.push_back(MI.getOperand(DefIdx).getReg());
@@ -602,7 +608,7 @@ public:
 
       const unsigned NumRegs = NumMergeRegs / NumDefs;
       for (unsigned DefIdx = 0; DefIdx < NumDefs; ++DefIdx) {
-        SmallVector<Register, 2> Regs;
+        SmallVector<Register, 8> Regs;
         for (unsigned j = 0, Idx = NumRegs * DefIdx + 1; j < NumRegs;
              ++j, ++Idx)
           Regs.push_back(MergeI->getOperand(Idx).getReg());
@@ -744,6 +750,8 @@ public:
       Changed = tryCombineMerges(MI, DeadInsts, UpdatedDefs, WrapperObserver);
       break;
     case TargetOpcode::G_MERGE_VALUES:
+    case TargetOpcode::G_BUILD_VECTOR:
+    case TargetOpcode::G_CONCAT_VECTORS:
       // If any of the users of this merge are an unmerge, then add them to the
       // artifact worklist in case there's folding that can be done looking up.
       for (MachineInstr &U : MRI.use_instructions(MI.getOperand(0).getReg())) {
@@ -805,17 +813,17 @@ public:
   }
 
 private:
-  static unsigned getArtifactSrcReg(const MachineInstr &MI) {
+  static Register getArtifactSrcReg(const MachineInstr &MI) {
     switch (MI.getOpcode()) {
     case TargetOpcode::COPY:
     case TargetOpcode::G_TRUNC:
     case TargetOpcode::G_ZEXT:
     case TargetOpcode::G_ANYEXT:
     case TargetOpcode::G_SEXT:
-    case TargetOpcode::G_UNMERGE_VALUES:
-      return MI.getOperand(MI.getNumOperands() - 1).getReg();
     case TargetOpcode::G_EXTRACT:
       return MI.getOperand(1).getReg();
+    case TargetOpcode::G_UNMERGE_VALUES:
+      return MI.getOperand(MI.getNumOperands() - 1).getReg();
     default:
       llvm_unreachable("Not a legalization artifact happen");
     }
@@ -839,7 +847,7 @@ private:
     // and as a result, %3, %2, %1 are dead.
     MachineInstr *PrevMI = &MI;
     while (PrevMI != &DefMI) {
-      unsigned PrevRegSrc = getArtifactSrcReg(*PrevMI);
+      Register PrevRegSrc = getArtifactSrcReg(*PrevMI);
 
       MachineInstr *TmpDef = MRI.getVRegDef(PrevRegSrc);
       if (MRI.hasOneUse(PrevRegSrc)) {
@@ -908,7 +916,7 @@ private:
 
   /// Looks through copy instructions and returns the actual
   /// source register.
-  unsigned lookThroughCopyInstrs(Register Reg) {
+  Register lookThroughCopyInstrs(Register Reg) {
     Register TmpReg;
     while (mi_match(Reg, MRI, m_Copy(m_Reg(TmpReg)))) {
       if (MRI.getType(TmpReg).isValid())

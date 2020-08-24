@@ -60,6 +60,7 @@ def UndefinedBoolConversion : DiagGroup<"undefined-bool-conversion">;
 def BoolConversion : DiagGroup<"bool-conversion", [PointerBoolConversion,
                                                    UndefinedBoolConversion]>;
 def IntConversion : DiagGroup<"int-conversion">;
+def ClassConversion: DiagGroup<"class-conversion">;
 def DeprecatedEnumCompareConditional :
   DiagGroup<"deprecated-enum-compare-conditional">;
 def EnumCompareConditional : DiagGroup<"enum-compare-conditional",
@@ -106,6 +107,7 @@ def DoublePromotion : DiagGroup<"double-promotion">;
 def EnumTooLarge : DiagGroup<"enum-too-large">;
 def UnsupportedNan : DiagGroup<"unsupported-nan">;
 def UnsupportedAbs : DiagGroup<"unsupported-abs">;
+def UnsupportedFPOpt : DiagGroup<"unsupported-floating-point-opt">;
 def UnsupportedCB : DiagGroup<"unsupported-cb">;
 def UnsupportedGPOpt : DiagGroup<"unsupported-gpopt">;
 def UnsupportedTargetOpt : DiagGroup<"unsupported-target-opt">;
@@ -278,9 +280,12 @@ def CXX98CompatPedantic : DiagGroup<"c++98-compat-pedantic",
 
 def CXX11Narrowing : DiagGroup<"c++11-narrowing">;
 
-def CXX11WarnOverrideDestructor :
+def CXX11WarnInconsistentOverrideDestructor :
   DiagGroup<"inconsistent-missing-destructor-override">;
-def CXX11WarnOverrideMethod : DiagGroup<"inconsistent-missing-override">;
+def CXX11WarnInconsistentOverrideMethod :
+  DiagGroup<"inconsistent-missing-override">;
+def CXX11WarnSuggestOverrideDestructor : DiagGroup<"suggest-destructor-override">;
+def CXX11WarnSuggestOverride : DiagGroup<"suggest-override">;
 
 // Original name of this warning in Clang
 def : DiagGroup<"c++0x-narrowing", [CXX11Narrowing]>;
@@ -381,6 +386,8 @@ def IncompleteModule : DiagGroup<"incomplete-module",
 def PrivateModule : DiagGroup<"private-module">;
 
 def CXX11InlineNamespace : DiagGroup<"c++11-inline-namespace">;
+def InlineNamespaceReopenedNoninline
+    : DiagGroup<"inline-namespace-reopened-noninline">;
 def InvalidNoreturn : DiagGroup<"invalid-noreturn">;
 def InvalidSourceEncoding : DiagGroup<"invalid-source-encoding">;
 def KNRPromotedParameter : DiagGroup<"knr-promoted-parameter">;
@@ -540,6 +547,7 @@ def StaticLocalInInline : DiagGroup<"static-local-in-inline">;
 def GNUStaticFloatInit : DiagGroup<"gnu-static-float-init">;
 def StaticFloatInit : DiagGroup<"static-float-init", [GNUStaticFloatInit]>;
 def GNUStatementExpression : DiagGroup<"gnu-statement-expression">;
+def StringConcatation : DiagGroup<"string-concatenation">;
 def StringCompare : DiagGroup<"string-compare">;
 def StringPlusInt : DiagGroup<"string-plus-int">;
 def StringPlusChar : DiagGroup<"string-plus-char">;
@@ -548,12 +556,16 @@ def IntInBoolContext : DiagGroup<"int-in-bool-context">;
 def TautologicalTypeLimitCompare : DiagGroup<"tautological-type-limit-compare">;
 def TautologicalUnsignedZeroCompare : DiagGroup<"tautological-unsigned-zero-compare">;
 def TautologicalUnsignedEnumZeroCompare : DiagGroup<"tautological-unsigned-enum-zero-compare">;
+// For compatibility with GCC. Tautological comparison warnings for constants
+// that are an extremal value of the type.
+def TypeLimits : DiagGroup<"type-limits", [TautologicalTypeLimitCompare,
+                                           TautologicalUnsignedZeroCompare,
+                                           TautologicalUnsignedEnumZeroCompare]>;
+// Additional tautological comparison warnings based on the expression, not
+// only on its type.
+def TautologicalValueRangeCompare : DiagGroup<"tautological-value-range-compare">;
 def TautologicalInRangeCompare : DiagGroup<"tautological-constant-in-range-compare",
-                                           [TautologicalTypeLimitCompare,
-                                            TautologicalUnsignedZeroCompare,
-                                            TautologicalUnsignedEnumZeroCompare]>;
-// For compatibility with GCC; -Wtype-limits = -Wtautological-constant-in-range-compare
-def TypeLimits : DiagGroup<"type-limits", [TautologicalInRangeCompare]>;
+                                           [TypeLimits, TautologicalValueRangeCompare]>;
 def TautologicalOutOfRangeCompare : DiagGroup<"tautological-constant-out-of-range-compare">;
 def TautologicalConstantCompare : DiagGroup<"tautological-constant-compare",
                                             [TautologicalOutOfRangeCompare]>;
@@ -617,7 +629,6 @@ def ImplicitFallthrough  : DiagGroup<"implicit-fallthrough",
 def InvalidPPToken : DiagGroup<"invalid-pp-token">;
 def Trigraphs      : DiagGroup<"trigraphs">;
 
-def : DiagGroup<"type-limits">;
 def UndefinedReinterpretCast : DiagGroup<"undefined-reinterpret-cast">;
 def ReinterpretBaseClass : DiagGroup<"reinterpret-base-class">;
 def Unicode  : DiagGroup<"unicode">;
@@ -692,6 +703,7 @@ def ReorderInitList : DiagGroup<"reorder-init-list">;
 def Reorder : DiagGroup<"reorder", [ReorderCtor, ReorderInitList]>;
 def UndeclaredSelector : DiagGroup<"undeclared-selector">;
 def ImplicitAtomic : DiagGroup<"implicit-atomic-properties">;
+def AtomicAlignment : DiagGroup<"atomic-alignment">;
 def CustomAtomic : DiagGroup<"custom-atomic-properties">;
 def AtomicProperties : DiagGroup<"atomic-properties",
                                  [ImplicitAtomic, CustomAtomic]>;
@@ -721,8 +733,8 @@ def OverridingMethodMismatch : DiagGroup<"overriding-method-mismatch">;
 def VariadicMacros : DiagGroup<"variadic-macros">;
 def VectorConversion : DiagGroup<"vector-conversion">;      // clang specific
 def VexingParse : DiagGroup<"vexing-parse">;
-def VLA : DiagGroup<"vla">;
 def VLAExtension : DiagGroup<"vla-extension">;
+def VLA : DiagGroup<"vla", [VLAExtension]>;
 def VolatileRegisterVar : DiagGroup<"volatile-register-var">;
 def Visibility : DiagGroup<"visibility">;
 def ZeroLengthArray : DiagGroup<"zero-length-array">;
@@ -869,7 +881,8 @@ def Extra : DiagGroup<"extra", [
     SignCompare,
     UnusedParameter,
     NullPointerArithmetic,
-    EmptyInitStatement
+    EmptyInitStatement,
+    StringConcatation
   ]>;
 
 def Most : DiagGroup<"most", [
@@ -1095,6 +1108,11 @@ def ObjCSignedCharBool : DiagGroup<"objc-signed-char-bool",
    ObjCSignedCharBoolImplicitFloatConversion,
    ObjCBoolConstantConversion,
    TautologicalObjCBoolCompare]>;
+
+def ObjCPotentiallyDirectSelector : DiagGroup<"potentially-direct-selector">;
+def ObjCStrictPotentiallyDirectSelector :
+  DiagGroup<"strict-potentially-direct-selector",
+            [ObjCPotentiallyDirectSelector]>;
 
 // Inline ASM warnings.
 def ASMOperandWidths : DiagGroup<"asm-operand-widths">;

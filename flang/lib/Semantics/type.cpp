@@ -174,16 +174,9 @@ bool DerivedTypeSpec::IsForwardReferenced() const {
 }
 
 bool DerivedTypeSpec::HasDefaultInitialization() const {
-  for (const Scope *scope{scope_}; scope;
-       scope = scope->GetDerivedTypeParent()) {
-    for (const auto &pair : *scope) {
-      const Symbol &symbol{*pair.second};
-      if (IsAllocatable(symbol) || IsInitialized(symbol)) {
-        return true;
-      }
-    }
-  }
-  return false;
+  DirectComponentIterator components{*this};
+  return bool{std::find_if(components.begin(), components.end(),
+      [](const Symbol &component) { return IsInitialized(component); })};
 }
 
 ParamValue *DerivedTypeSpec::FindParameter(SourceName target) {
@@ -446,7 +439,7 @@ llvm::raw_ostream &operator<<(llvm::raw_ostream &o, const DerivedTypeSpec &x) {
   return o << x.AsFortran();
 }
 
-Bound::Bound(int bound) : expr_{bound} {}
+Bound::Bound(common::ConstantSubscript bound) : expr_{bound} {}
 
 llvm::raw_ostream &operator<<(llvm::raw_ostream &o, const Bound &x) {
   if (x.isAssumed()) {

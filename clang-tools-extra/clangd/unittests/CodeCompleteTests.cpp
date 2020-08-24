@@ -108,7 +108,7 @@ CodeCompleteResult completions(const TestTU &TU, Position Point,
     Opts.Index = OverrideIndex.get();
   }
 
-  MockFSProvider FS;
+  MockFS FS;
   auto Inputs = TU.inputs(FS);
   Inputs.Opts.BuildRecoveryAST = true;
   Inputs.Opts.PreserveRecoveryASTType = true;
@@ -149,7 +149,7 @@ CodeCompleteResult completionsNoCompile(llvm::StringRef Text,
     Opts.Index = OverrideIndex.get();
   }
 
-  MockFSProvider FS;
+  MockFS FS;
   Annotations Test(Text);
   ParseInputs ParseInput{tooling::CompileCommand(), &FS, Test.code().str()};
   return codeComplete(FilePath, Test.point(), /*Preamble=*/nullptr, ParseInput,
@@ -194,9 +194,14 @@ TEST(CompletionTest, Filter) {
   EXPECT_THAT(completions(Body + "int main() { S().Foba^ }").Completions,
               AllOf(Has("FooBar"), Has("FooBaz"), Not(Has("Qux"))));
 
-  // Macros require  prefix match.
-  EXPECT_THAT(completions(Body + "int main() { C^ }").Completions,
-              AllOf(Has("Car"), Not(Has("MotorCar"))));
+  // Macros require prefix match, either from index or AST.
+  Symbol Sym = var("MotorCarIndex");
+  Sym.SymInfo.Kind = index::SymbolKind::Macro;
+  EXPECT_THAT(
+      completions(Body + "int main() { C^ }", {Sym}).Completions,
+      AllOf(Has("Car"), Not(Has("MotorCar")), Not(Has("MotorCarIndex"))));
+  EXPECT_THAT(completions(Body + "int main() { M^ }", {Sym}).Completions,
+              AllOf(Has("MotorCar"), Has("MotorCarIndex")));
 }
 
 void testAfterDotCompletion(clangd::CodeCompleteOptions Opts) {
@@ -770,7 +775,7 @@ TEST(CompletionTest, CompletionRecoveryASTType) {
 }
 
 TEST(CompletionTest, DynamicIndexIncludeInsertion) {
-  MockFSProvider FS;
+  MockFS FS;
   MockCompilationDatabase CDB;
   ClangdServer::Options Opts = ClangdServer::optsForTest();
   Opts.BuildDynamicSymbolIndex = true;
@@ -805,7 +810,7 @@ TEST(CompletionTest, DynamicIndexIncludeInsertion) {
 }
 
 TEST(CompletionTest, DynamicIndexMultiFile) {
-  MockFSProvider FS;
+  MockFS FS;
   MockCompilationDatabase CDB;
   auto Opts = ClangdServer::optsForTest();
   Opts.BuildDynamicSymbolIndex = true;
@@ -865,7 +870,7 @@ TEST(CompletionTest, Documentation) {
 }
 
 TEST(CompletionTest, CommentsFromSystemHeaders) {
-  MockFSProvider FS;
+  MockFS FS;
   MockCompilationDatabase CDB;
 
   auto Opts = ClangdServer::optsForTest();
@@ -1057,7 +1062,7 @@ SignatureHelp signatures(llvm::StringRef Text, Position Point,
     Index = memIndex(IndexSymbols);
 
   auto TU = TestTU::withCode(Text);
-  MockFSProvider FS;
+  MockFS FS;
   auto Inputs = TU.inputs(FS);
   Inputs.Index = Index.get();
   Inputs.Opts.BuildRecoveryAST = true;
@@ -1161,44 +1166,75 @@ TEST(SignatureHelpTest, ActiveArg) {
 }
 
 TEST(SignatureHelpTest, OpeningParen) {
-  llvm::StringLiteral Tests[] = {// Recursive function call.
-                                 R"cpp(
-    int foo(int a, int b, int c);
-    int main() {
-      foo(foo $p^( foo(10, 10, 10), ^ )));
-    })cpp",
-                                 // Functional type cast.
-                                 R"cpp(
-    struct Foo {
-      Foo(int a, int b, int c);
-    };
-    int main() {
-      Foo $p^( 10, ^ );
-    })cpp",
-                                 // New expression.
-                                 R"cpp(
-    struct Foo {
-      Foo(int a, int b, int c);
-    };
-    int main() {
-      new Foo $p^( 10, ^ );
-    })cpp",
-                                 // Macro expansion.
-                                 R"cpp(
-    int foo(int a, int b, int c);
-    #define FOO foo(
+  llvm::StringLiteral Tests[] = {
+      // Recursive function call.
+      R"cpp(
+        int foo(int a, int b, int c);
+        int main() {
+          foo(foo $p^( foo(10, 10, 10), ^ )));
+        })cpp",
+      // Functional type cast.
+      R"cpp(
+        struct Foo {
+          Foo(int a, int b, int c);
+        };
+        int main() {
+          Foo $p^( 10, ^ );
+        })cpp",
+      // New expression.
+      R"cpp(
+        struct Foo {
+          Foo(int a, int b, int c);
+        };
+        int main() {
+          new Foo $p^( 10, ^ );
+        })cpp",
+      // Macro expansion.
+      R"cpp(
+        int foo(int a, int b, int c);
+        #define FOO foo(
 
-    int main() {
-      // Macro expansions.
-      $p^FOO 10, ^ );
-    })cpp",
-                                 // Macro arguments.
-                                 R"cpp(
-    int foo(int a, int b, int c);
-    int main() {
-    #define ID(X) X
-      ID(foo $p^( foo(10), ^ ))
-    })cpp"};
+        int main() {
+          // Macro expansions.
+          $p^FOO 10, ^ );
+        })cpp",
+      // Macro arguments.
+      R"cpp(
+        int foo(int a, int b, int c);
+        int main() {
+        #define ID(X) X
+          // FIXME: figure out why ID(foo (foo(10), )) doesn't work when preserving
+          // the recovery expression.
+          ID(foo $p^( 10, ^ ))
+        })cpp",
+      // Dependent args.
+      R"cpp(
+        int foo(int a, int b);
+        template <typename T> void bar(T t) {
+          foo$p^(t, ^t);
+        })cpp",
+      // Dependent args on templated func.
+      R"cpp(
+        template <typename T>
+        int foo(T, T);
+        template <typename T> void bar(T t) {
+          foo$p^(t, ^t);
+        })cpp",
+      // Dependent args on member.
+      R"cpp(
+        struct Foo { int foo(int, int); };
+        template <typename T> void bar(T t) {
+          Foo f;
+          f.foo$p^(t, ^t);
+        })cpp",
+      // Dependent args on templated member.
+      R"cpp(
+        struct Foo { template <typename T> int foo(T, T); };
+        template <typename T> void bar(T t) {
+          Foo f;
+          f.foo$p^(t, ^t);
+        })cpp",
+  };
 
   for (auto Test : Tests) {
     Annotations Code(Test);
@@ -1212,7 +1248,7 @@ TEST(SignatureHelpTest, StalePreamble) {
   TestTU TU;
   TU.Code = "";
   IgnoreDiagnostics Diags;
-  MockFSProvider FS;
+  MockFS FS;
   auto Inputs = TU.inputs(FS);
   auto CI = buildCompilerInvocation(Inputs, Diags);
   ASSERT_TRUE(CI);
@@ -1535,7 +1571,7 @@ TEST(CompletionTest, OverloadBundling) {
 }
 
 TEST(CompletionTest, DocumentationFromChangedFileCrash) {
-  MockFSProvider FS;
+  MockFS FS;
   auto FooH = testPath("foo.h");
   auto FooCpp = testPath("foo.cpp");
   FS.Files[FooH] = R"cpp(
@@ -1630,7 +1666,7 @@ TEST(CompletionTest, CompleteOnInvalidLine) {
   auto FooCpp = testPath("foo.cpp");
 
   MockCompilationDatabase CDB;
-  MockFSProvider FS;
+  MockFS FS;
   FS.Files[FooCpp] = "// empty file";
 
   ClangdServer Server(CDB, FS, ClangdServer::optsForTest());
@@ -1759,7 +1795,7 @@ TEST(CompletionTest, CodeCompletionContext) {
 }
 
 TEST(CompletionTest, FixItForArrowToDot) {
-  MockFSProvider FS;
+  MockFS FS;
   MockCompilationDatabase CDB;
 
   CodeCompleteOptions Opts;
@@ -1870,7 +1906,7 @@ TEST(CompletionTest, RenderWithFixItNonMerged) {
 }
 
 TEST(CompletionTest, CompletionTokenRange) {
-  MockFSProvider FS;
+  MockFS FS;
   MockCompilationDatabase CDB;
   TestTU TU;
   TU.AdditionalFiles["foo/abc/foo.h"] = "";
@@ -2035,7 +2071,7 @@ TEST(SignatureHelpTest, IndexDocumentation) {
 }
 
 TEST(SignatureHelpTest, DynamicIndexDocumentation) {
-  MockFSProvider FS;
+  MockFS FS;
   MockCompilationDatabase CDB;
   ClangdServer::Options Opts = ClangdServer::optsForTest();
   Opts.BuildDynamicSymbolIndex = true;
@@ -2207,7 +2243,7 @@ TEST(GuessCompletionPrefix, Filters) {
 }
 
 TEST(CompletionTest, EnableSpeculativeIndexRequest) {
-  MockFSProvider FS;
+  MockFS FS;
   MockCompilationDatabase CDB;
   ClangdServer Server(CDB, FS, ClangdServer::optsForTest());
 

@@ -13,6 +13,7 @@
 #include "OutputSegment.h"
 #include "SymbolTable.h"
 #include "Symbols.h"
+#include "SyntheticSections.h"
 #include "Target.h"
 #include "Writer.h"
 
@@ -27,15 +28,20 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/BinaryFormat/MachO.h"
 #include "llvm/BinaryFormat/Magic.h"
-#include "llvm/Config/config.h"
 #include "llvm/Object/Archive.h"
 #include "llvm/Option/ArgList.h"
 #include "llvm/Option/Option.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Host.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 
+#include <algorithm>
+
 using namespace llvm;
 using namespace llvm::MachO;
+using namespace llvm::object;
+using namespace llvm::opt;
 using namespace llvm::sys;
 using namespace lld;
 using namespace lld::macho;
@@ -74,25 +80,63 @@ opt::InputArgList MachOOptTable::parse(ArrayRef<const char *> argv) {
   return args;
 }
 
-static Optional<std::string> findLibrary(StringRef name) {
-  std::string stub = (llvm::Twine("lib") + name + ".tbd").str();
-  std::string shared = (llvm::Twine("lib") + name + ".dylib").str();
-  std::string archive = (llvm::Twine("lib") + name + ".a").str();
-  llvm::SmallString<260> location;
+void MachOOptTable::printHelp(const char *argv0, bool showHidden) const {
+  PrintHelp(lld::outs(), (std::string(argv0) + " [options] file...").c_str(),
+            "LLVM Linker", showHidden);
+  lld::outs() << "\n";
+}
 
-  for (StringRef dir : config->searchPaths) {
-    for (StringRef library : {stub, shared, archive}) {
+static Optional<std::string> findWithExtension(StringRef base,
+                                               ArrayRef<StringRef> extensions) {
+  for (StringRef ext : extensions) {
+    Twine location = base + ext;
+    if (fs::exists(location))
+      return location.str();
+  }
+  return {};
+}
+
+static Optional<std::string> findLibrary(StringRef name) {
+  llvm::SmallString<261> location;
+  for (StringRef dir : config->librarySearchPaths) {
       location = dir;
-      llvm::sys::path::append(location, library);
-      if (fs::exists(location))
-        return location.str().str();
+      path::append(location, Twine("lib") + name);
+      if (Optional<std::string> path =
+              findWithExtension(location, {".tbd", ".dylib", ".a"}))
+        return path;
+  }
+  return {};
+}
+
+static Optional<std::string> findFramework(StringRef name) {
+  llvm::SmallString<260> symlink;
+  StringRef suffix;
+  std::tie(name, suffix) = name.split(",");
+  for (StringRef dir : config->frameworkSearchPaths) {
+    symlink = dir;
+    path::append(symlink, name + ".framework", name);
+
+    if (!suffix.empty()) {
+      // NOTE: we must resolve the symlink before trying the suffixes, because
+      // there are no symlinks for the suffixed paths.
+      llvm::SmallString<260> location;
+      if (!fs::real_path(symlink, location)) {
+        // only append suffix if realpath() succeeds
+        Twine suffixed = location + suffix;
+        if (fs::exists(suffixed))
+          return suffixed.str();
+      }
+      // Suffix lookup failed, fall through to the no-suffix case.
     }
+
+    if (Optional<std::string> path = findWithExtension(symlink, {".tbd", ""}))
+      return path;
   }
   return {};
 }
 
 static TargetInfo *createTargetInfo(opt::InputArgList &args) {
-  StringRef arch = llvm::Triple(LLVM_DEFAULT_TARGET_TRIPLE).getArchName();
+  StringRef arch = args.getLastArgValue(OPT_arch, "x86_64");
   config->arch = llvm::MachO::getArchitectureFromName(
       args.getLastArgValue(OPT_arch, arch));
   switch (config->arch) {
@@ -100,17 +144,67 @@ static TargetInfo *createTargetInfo(opt::InputArgList &args) {
   case llvm::MachO::AK_x86_64h:
     return createX86_64TargetInfo();
   default:
-    fatal("missing or unsupported -arch " + args.getLastArgValue(OPT_arch));
+    fatal("missing or unsupported -arch " + arch);
   }
 }
 
-static std::vector<StringRef> getSearchPaths(opt::InputArgList &args) {
-  std::vector<StringRef> ret{args::getStrings(args, OPT_L)};
-  if (!args.hasArg(OPT_Z)) {
-    ret.push_back("/usr/lib");
-    ret.push_back("/usr/local/lib");
+static bool isDirectory(StringRef option, StringRef path) {
+  if (!fs::exists(path)) {
+    warn("directory not found for option -" + option + path);
+    return false;
+  } else if (!fs::is_directory(path)) {
+    warn("option -" + option + path + " references a non-directory path");
+    return false;
   }
-  return ret;
+  return true;
+}
+
+static void getSearchPaths(std::vector<StringRef> &paths, unsigned optionCode,
+                           opt::InputArgList &args,
+                           const std::vector<StringRef> &roots,
+                           const SmallVector<StringRef, 2> &systemPaths) {
+  StringRef optionLetter{(optionCode == OPT_F ? "F" : "L")};
+  for (auto const &path : args::getStrings(args, optionCode)) {
+    // NOTE: only absolute paths are re-rooted to syslibroot(s)
+    if (llvm::sys::path::is_absolute(path, llvm::sys::path::Style::posix)) {
+      for (StringRef root : roots) {
+        SmallString<261> buffer(root);
+        llvm::sys::path::append(buffer, path);
+        // Do not warn about paths that are computed via the syslib roots
+        if (llvm::sys::fs::is_directory(buffer))
+          paths.push_back(saver.save(buffer.str()));
+      }
+    } else {
+      if (isDirectory(optionLetter, path))
+        paths.push_back(path);
+    }
+  }
+
+  // `-Z` suppresses the standard "system" search paths.
+  if (args.hasArg(OPT_Z))
+    return;
+
+  for (auto const &path : systemPaths) {
+    for (auto root : roots) {
+      SmallString<261> buffer(root);
+      llvm::sys::path::append(buffer, path);
+      if (isDirectory(optionLetter, buffer))
+        paths.push_back(saver.save(buffer.str()));
+    }
+  }
+}
+
+static void getLibrarySearchPaths(opt::InputArgList &args,
+                                  const std::vector<StringRef> &roots,
+                                  std::vector<StringRef> &paths) {
+  getSearchPaths(paths, OPT_L, args, roots, {"/usr/lib", "/usr/local/lib"});
+}
+
+static void getFrameworkSearchPaths(opt::InputArgList &args,
+                                    const std::vector<StringRef> &roots,
+                                    std::vector<StringRef> &paths) {
+  getSearchPaths(paths, OPT_F, args, roots,
+                 {"/Library/Frameworks", "/System/Library/Frameworks"});
 }
 
 static void addFile(StringRef path) {
@@ -137,18 +231,56 @@ static void addFile(StringRef path) {
     inputFiles.push_back(make<DylibFile>(mbref));
     break;
   case file_magic::tapi_file: {
-    llvm::Expected<std::unique_ptr<llvm::MachO::InterfaceFile>> result =
-        TextAPIReader::get(mbref);
-    if (!result)
+    Expected<std::unique_ptr<InterfaceFile>> result = TextAPIReader::get(mbref);
+    if (!result) {
+      error("could not load TAPI file at " + mbref.getBufferIdentifier() +
+            ": " + toString(result.takeError()));
       return;
-
-    std::unique_ptr<llvm::MachO::InterfaceFile> interface{std::move(*result)};
-    inputFiles.push_back(make<DylibFile>(std::move(interface)));
+    }
+    inputFiles.push_back(make<DylibFile>(**result));
     break;
   }
   default:
     error(path + ": unhandled file type");
   }
+}
+
+static void addFileList(StringRef path) {
+  Optional<MemoryBufferRef> buffer = readFile(path);
+  if (!buffer)
+    return;
+  MemoryBufferRef mbref = *buffer;
+  for (StringRef path : args::getLines(mbref))
+    addFile(path);
+}
+
+// Returns slices of MB by parsing MB as an archive file.
+// Each slice consists of a member file in the archive.
+static std::vector<MemoryBufferRef> getArchiveMembers(MemoryBufferRef mb) {
+  std::unique_ptr<Archive> file =
+      CHECK(Archive::create(mb),
+            mb.getBufferIdentifier() + ": failed to parse archive");
+
+  std::vector<MemoryBufferRef> v;
+  Error err = Error::success();
+  for (const Archive::Child &c : file->children(err)) {
+    MemoryBufferRef mbref =
+        CHECK(c.getMemoryBufferRef(),
+              mb.getBufferIdentifier() +
+                  ": could not get the buffer for a child of the archive");
+    v.push_back(mbref);
+  }
+  if (err)
+    fatal(mb.getBufferIdentifier() +
+          ": Archive::children failed: " + toString(std::move(err)));
+
+  return v;
+}
+
+static void forceLoadArchive(StringRef path) {
+  if (Optional<MemoryBufferRef> buffer = readFile(path))
+    for (MemoryBufferRef member : getArchiveMembers(*buffer))
+      inputFiles.push_back(make<ObjFile>(member));
 }
 
 static std::array<StringRef, 6> archNames{"arm",    "arm64", "i386",
@@ -169,7 +301,7 @@ static bool isArchString(StringRef s) {
 // entry (the one nearest to the front of the list.)
 //
 // The file can also have line comments that start with '#'.
-void parseOrderFile(StringRef path) {
+static void parseOrderFile(StringRef path) {
   Optional<MemoryBufferRef> buffer = readFile(path);
   if (!buffer) {
     error("Could not read order file at " + path);
@@ -259,15 +391,82 @@ static bool markSubLibrary(StringRef searchName) {
   return false;
 }
 
-static void handlePlatformVersion(opt::ArgList::iterator &it,
-                                  const opt::ArgList::iterator &end) {
-  // -platform_version takes 3 args, which LLVM's option library doesn't
-  // support directly.  So this explicitly handles that.
-  // FIXME: stash skipped args for later use.
-  for (int i = 0; i < 3; ++i) {
-    ++it;
-    if (it == end || (*it)->getOption().getID() != OPT_INPUT)
-      fatal("usage: -platform_version platform min_version sdk_version");
+static inline char toLowerDash(char x) {
+  if (x >= 'A' && x <= 'Z')
+    return x - 'A' + 'a';
+  else if (x == ' ')
+    return '-';
+  return x;
+}
+
+static std::string lowerDash(StringRef s) {
+  return std::string(map_iterator(s.begin(), toLowerDash),
+                     map_iterator(s.end(), toLowerDash));
+}
+
+static void handlePlatformVersion(const opt::Arg *arg) {
+  StringRef platformStr = arg->getValue(0);
+  StringRef minVersionStr = arg->getValue(1);
+  StringRef sdkVersionStr = arg->getValue(2);
+
+  // TODO(compnerd) see if we can generate this case list via XMACROS
+  config->platform.kind =
+      llvm::StringSwitch<llvm::MachO::PlatformKind>(lowerDash(platformStr))
+          .Cases("macos", "1", llvm::MachO::PlatformKind::macOS)
+          .Cases("ios", "2", llvm::MachO::PlatformKind::iOS)
+          .Cases("tvos", "3", llvm::MachO::PlatformKind::tvOS)
+          .Cases("watchos", "4", llvm::MachO::PlatformKind::watchOS)
+          .Cases("bridgeos", "5", llvm::MachO::PlatformKind::bridgeOS)
+          .Cases("mac-catalyst", "6", llvm::MachO::PlatformKind::macCatalyst)
+          .Cases("ios-simulator", "7", llvm::MachO::PlatformKind::iOSSimulator)
+          .Cases("tvos-simulator", "8",
+                 llvm::MachO::PlatformKind::tvOSSimulator)
+          .Cases("watchos-simulator", "9",
+                 llvm::MachO::PlatformKind::watchOSSimulator)
+          .Default(llvm::MachO::PlatformKind::unknown);
+  if (config->platform.kind == llvm::MachO::PlatformKind::unknown)
+    error(Twine("malformed platform: ") + platformStr);
+  // TODO: check validity of version strings, which varies by platform
+  // NOTE: ld64 accepts version strings with 5 components
+  // llvm::VersionTuple accepts no more than 4 components
+  // Has Apple ever published version strings with 5 components?
+  if (config->platform.minimum.tryParse(minVersionStr))
+    error(Twine("malformed minimum version: ") + minVersionStr);
+  if (config->platform.sdk.tryParse(sdkVersionStr))
+    error(Twine("malformed sdk version: ") + sdkVersionStr);
+}
+
+static void warnIfDeprecatedOption(const opt::Option &opt) {
+  if (!opt.getGroup().isValid())
+    return;
+  if (opt.getGroup().getID() == OPT_grp_deprecated) {
+    warn("Option `" + opt.getPrefixedName() + "' is deprecated in ld64:");
+    warn(opt.getHelpText());
+  }
+}
+
+static void warnIfUnimplementedOption(const opt::Option &opt) {
+  if (!opt.getGroup().isValid())
+    return;
+  switch (opt.getGroup().getID()) {
+  case OPT_grp_deprecated:
+    // warn about deprecated options elsewhere
+    break;
+  case OPT_grp_undocumented:
+    warn("Option `" + opt.getPrefixedName() +
+         "' is undocumented. Should lld implement it?");
+    break;
+  case OPT_grp_obsolete:
+    warn("Option `" + opt.getPrefixedName() +
+         "' is obsolete. Please modernize your usage.");
+    break;
+  case OPT_grp_ignored:
+    warn("Option `" + opt.getPrefixedName() + "' is ignored.");
+    break;
+  default:
+    warn("Option `" + opt.getPrefixedName() +
+         "' is not yet implemented. Stay tuned...");
+    break;
   }
 }
 
@@ -282,6 +481,14 @@ bool macho::link(llvm::ArrayRef<const char *> argsArr, bool canExitEarly,
   MachOOptTable parser;
   opt::InputArgList args = parser.parse(argsArr.slice(1));
 
+  if (args.hasArg(OPT_help_hidden)) {
+    parser.printHelp(argsArr[0], /*showHidden=*/true);
+    return true;
+  } else if (args.hasArg(OPT_help)) {
+    parser.printHelp(argsArr[0], /*showHidden=*/false);
+    return true;
+  }
+
   config = make<Configuration>();
   symtab = make<SymbolTable>();
   target = createTargetInfo(args);
@@ -290,24 +497,50 @@ bool macho::link(llvm::ArrayRef<const char *> argsArr, bool canExitEarly,
   config->outputFile = args.getLastArgValue(OPT_o, "a.out");
   config->installName =
       args.getLastArgValue(OPT_install_name, config->outputFile);
-  config->searchPaths = getSearchPaths(args);
+  config->headerPad = args::getHex(args, OPT_headerpad, /*Default=*/32);
   config->outputType = args.hasArg(OPT_dylib) ? MH_DYLIB : MH_EXECUTE;
+  config->runtimePaths = args::getStrings(args, OPT_rpath);
+
+  std::vector<StringRef> roots;
+  for (const Arg *arg : args.filtered(OPT_syslibroot))
+    roots.push_back(arg->getValue());
+  // NOTE: the final `-syslibroot` being `/` will ignore all roots
+  if (roots.size() && roots.back() == "/")
+    roots.clear();
+  // NOTE: roots can never be empty - add an empty root to simplify the library
+  // and framework search path computation.
+  if (roots.empty())
+    roots.emplace_back("");
+
+  getLibrarySearchPaths(args, roots, config->librarySearchPaths);
+  getFrameworkSearchPaths(args, roots, config->frameworkSearchPaths);
 
   if (args.hasArg(OPT_v)) {
     message(getLLDVersion());
-    std::vector<StringRef> &searchPaths = config->searchPaths;
-    message("Library search paths:\n" +
-            llvm::join(searchPaths.begin(), searchPaths.end(), "\n"));
+    message(StringRef("Library search paths:") +
+            (config->librarySearchPaths.size()
+                 ? "\n\t" + llvm::join(config->librarySearchPaths, "\n\t")
+                 : ""));
+    message(StringRef("Framework search paths:") +
+            (config->frameworkSearchPaths.size()
+                 ? "\n\t" + llvm::join(config->frameworkSearchPaths, "\n\t")
+                 : ""));
     freeArena();
     return !errorCount();
   }
 
-  for (opt::ArgList::iterator it = args.begin(), end = args.end(); it != end;
-       ++it) {
-    const opt::Arg *arg = *it;
+  for (const auto &arg : args) {
+    const auto &opt = arg->getOption();
+    warnIfDeprecatedOption(opt);
     switch (arg->getOption().getID()) {
     case OPT_INPUT:
       addFile(arg->getValue());
+      break;
+    case OPT_filelist:
+      addFileList(arg->getValue());
+      break;
+    case OPT_force_load:
+      forceLoadArchive(arg->getValue());
       break;
     case OPT_l: {
       StringRef name = arg->getValue();
@@ -318,10 +551,36 @@ bool macho::link(llvm::ArrayRef<const char *> argsArr, bool canExitEarly,
       error("library not found for -l" + name);
       break;
     }
-    case OPT_platform_version: {
-      handlePlatformVersion(it, end); // Can advance "it".
+    case OPT_framework: {
+      StringRef name = arg->getValue();
+      if (Optional<std::string> path = findFramework(name)) {
+        addFile(*path);
+        break;
+      }
+      error("framework not found for -framework " + name);
       break;
     }
+    case OPT_platform_version:
+      handlePlatformVersion(arg);
+      break;
+    case OPT_o:
+    case OPT_dylib:
+    case OPT_e:
+    case OPT_F:
+    case OPT_L:
+    case OPT_headerpad:
+    case OPT_install_name:
+    case OPT_rpath:
+    case OPT_sub_library:
+    case OPT_Z:
+    case OPT_arch:
+    case OPT_syslibroot:
+    case OPT_sectcreate:
+      // handled elsewhere
+      break;
+    default:
+      warnIfUnimplementedOption(opt);
+      break;
     }
   }
 
@@ -338,20 +597,22 @@ bool macho::link(llvm::ArrayRef<const char *> argsArr, bool canExitEarly,
   if (!orderFile.empty())
     parseOrderFile(orderFile);
 
-  // dyld requires us to load libSystem. Since we may run tests on non-OSX
-  // systems which do not have libSystem, we mock it out here.
-  // TODO: Replace this with a stub tbd file once we have TAPI support.
-  if (StringRef(getenv("LLD_IN_TEST")) == "1" &&
-      config->outputType == MH_EXECUTE) {
-    inputFiles.push_back(DylibFile::createLibSystemMock());
-  }
-
   if (config->outputType == MH_EXECUTE && !isa<Defined>(config->entry)) {
     error("undefined symbol: " + config->entry->getName());
     return false;
   }
 
   createSyntheticSections();
+  symtab->addDSOHandle(in.header);
+
+  for (opt::Arg *arg : args.filtered(OPT_sectcreate)) {
+    StringRef segName = arg->getValue(0);
+    StringRef sectName = arg->getValue(1);
+    StringRef fileName = arg->getValue(2);
+    Optional<MemoryBufferRef> buffer = readFile(fileName);
+    if (buffer)
+      inputFiles.push_back(make<OpaqueFile>(*buffer, segName, sectName));
+  }
 
   // Initialize InputSections.
   for (InputFile *file : inputFiles) {

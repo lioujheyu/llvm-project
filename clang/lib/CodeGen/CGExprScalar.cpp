@@ -26,8 +26,8 @@
 #include "clang/AST/RecordLayout.h"
 #include "clang/AST/StmtVisitor.h"
 #include "clang/Basic/CodeGenOptions.h"
-#include "clang/Basic/FixedPoint.h"
 #include "clang/Basic/TargetInfo.h"
+#include "llvm/ADT/APFixedPoint.h"
 #include "llvm/ADT/Optional.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
@@ -215,23 +215,6 @@ static bool CanElideOverflowCheck(const ASTContext &Ctx, const BinOpInfo &Op) {
          (2 * Ctx.getTypeSize(RHSTy)) < PromotedSize;
 }
 
-static void setBuilderFlagsFromFPFeatures(CGBuilderTy &Builder,
-                                          CodeGenFunction &CGF,
-                                          FPOptions FPFeatures) {
-  auto NewRoundingBehavior = FPFeatures.getRoundingMode();
-  Builder.setDefaultConstrainedRounding(NewRoundingBehavior);
-  auto NewExceptionBehavior =
-      ToConstrainedExceptMD(FPFeatures.getExceptionMode());
-  Builder.setDefaultConstrainedExcept(NewExceptionBehavior);
-  CGF.SetFastMathFlags(FPFeatures);
-  assert((CGF.CurFuncDecl == nullptr || Builder.getIsFPConstrained() ||
-          isa<CXXConstructorDecl>(CGF.CurFuncDecl) ||
-          isa<CXXDestructorDecl>(CGF.CurFuncDecl) ||
-          (NewExceptionBehavior == llvm::fp::ebIgnore &&
-           NewRoundingBehavior == llvm::RoundingMode::NearestTiesToEven)) &&
-         "FPConstrained should be enabled on entire function");
-}
-
 class ScalarExprEmitter
   : public StmtVisitor<ScalarExprEmitter, Value*> {
   CodeGenFunction &CGF;
@@ -373,8 +356,9 @@ public:
   /// and an integer.
   Value *EmitFixedPointConversion(Value *Src, QualType SrcTy, QualType DstTy,
                                   SourceLocation Loc);
-  Value *EmitFixedPointConversion(Value *Src, FixedPointSemantics &SrcFixedSema,
-                                  FixedPointSemantics &DstFixedSema,
+  Value *EmitFixedPointConversion(Value *Src,
+                                  llvm::FixedPointSemantics &SrcFixedSema,
+                                  llvm::FixedPointSemantics &DstFixedSema,
                                   SourceLocation Loc,
                                   bool DstIsInteger = false);
 
@@ -430,12 +414,18 @@ public:
   }
 
   Value *VisitStmt(Stmt *S) {
-    S->dump(CGF.getContext().getSourceManager());
+    S->dump(llvm::errs(), CGF.getContext());
     llvm_unreachable("Stmt can't have complex result type!");
   }
   Value *VisitExpr(Expr *S);
 
   Value *VisitConstantExpr(ConstantExpr *E) {
+    if (Value *Result = ConstantEmitter(CGF).tryEmitConstantExpr(E)) {
+      if (E->isGLValue())
+        return CGF.Builder.CreateLoad(Address(
+            Result, CGF.getContext().getTypeAlignInChars(E->getType())));
+      return Result;
+    }
     return Visit(E->getSubExpr());
   }
   Value *VisitParenExpr(ParenExpr *PE) {
@@ -764,8 +754,7 @@ public:
 
     if (Ops.LHS->getType()->isFPOrFPVectorTy()) {
       //  Preserve the old values
-      llvm::IRBuilder<>::FastMathFlagGuard FMFG(Builder);
-      setBuilderFlagsFromFPFeatures(Builder, CGF, Ops.FPFeatures);
+      CodeGenFunction::CGFPOptionsRAII FPOptsRAII(CGF, Ops.FPFeatures);
       return Builder.CreateFMul(Ops.LHS, Ops.RHS, "mul");
     }
     if (Ops.isFixedPointOp())
@@ -1456,17 +1445,17 @@ Value *ScalarExprEmitter::EmitScalarConversion(Value *Src, QualType SrcType,
 Value *ScalarExprEmitter::EmitFixedPointConversion(Value *Src, QualType SrcTy,
                                                    QualType DstTy,
                                                    SourceLocation Loc) {
-  FixedPointSemantics SrcFPSema =
-      CGF.getContext().getFixedPointSemantics(SrcTy);
-  FixedPointSemantics DstFPSema =
-      CGF.getContext().getFixedPointSemantics(DstTy);
+  auto SrcFPSema = CGF.getContext().getFixedPointSemantics(SrcTy);
+  auto DstFPSema = CGF.getContext().getFixedPointSemantics(DstTy);
   return EmitFixedPointConversion(Src, SrcFPSema, DstFPSema, Loc,
                                   DstTy->isIntegerType());
 }
 
 Value *ScalarExprEmitter::EmitFixedPointConversion(
-    Value *Src, FixedPointSemantics &SrcFPSema, FixedPointSemantics &DstFPSema,
+    Value *Src, llvm::FixedPointSemantics &SrcFPSema,
+    llvm::FixedPointSemantics &DstFPSema,
     SourceLocation Loc, bool DstIsInteger) {
+  using llvm::APFixedPoint;
   using llvm::APInt;
   using llvm::ConstantInt;
   using llvm::Value;
@@ -2360,7 +2349,6 @@ Value *ScalarExprEmitter::VisitStmtExpr(const StmtExpr *E) {
 }
 
 Value *ScalarExprEmitter::VisitExprWithCleanups(ExprWithCleanups *E) {
-  CGF.enterFullExpression(E);
   CodeGenFunction::RunCleanupsScope Scope(CGF);
   Value *V = Visit(E->getSubExpr());
   // Defend against dominance problems caused by jumps out of expression
@@ -2402,7 +2390,7 @@ llvm::Value *ScalarExprEmitter::EmitIncDecConsiderOverflowBehavior(
     if (!E->canOverflow())
       return Builder.CreateNSWAdd(InVal, Amount, Name);
     return EmitOverflowCheckedBinOp(createBinOpInfoFromIncDec(
-        E, InVal, IsInc, E->getFPFeatures(CGF.getLangOpts())));
+        E, InVal, IsInc, E->getFPFeaturesInEffect(CGF.getLangOpts())));
   }
   llvm_unreachable("Unknown SignedOverflowBehaviorTy");
 }
@@ -2549,7 +2537,7 @@ ScalarExprEmitter::EmitScalarPrePostIncDec(const UnaryOperator *E, LValue LV,
     } else if (E->canOverflow() && type->isUnsignedIntegerType() &&
                CGF.SanOpts.has(SanitizerKind::UnsignedIntegerOverflow)) {
       value = EmitOverflowCheckedBinOp(createBinOpInfoFromIncDec(
-          E, value, isInc, E->getFPFeatures(CGF.getLangOpts())));
+          E, value, isInc, E->getFPFeaturesInEffect(CGF.getLangOpts())));
     } else {
       llvm::Value *amt = llvm::ConstantInt::get(value->getType(), amount, true);
       value = Builder.CreateAdd(value, amt, isInc ? "inc" : "dec");
@@ -2680,12 +2668,10 @@ ScalarExprEmitter::EmitScalarPrePostIncDec(const UnaryOperator *E, LValue LV,
     // Now, convert from our invented integer literal to the type of the unary
     // op. This will upscale and saturate if necessary. This value can become
     // undef in some cases.
-    FixedPointSemantics SrcSema =
-        FixedPointSemantics::GetIntegerSemantics(value->getType()
-                                                      ->getScalarSizeInBits(),
-                                                 /*IsSigned=*/true);
-    FixedPointSemantics DstSema =
-        CGF.getContext().getFixedPointSemantics(Info.Ty);
+    auto SrcSema =
+        llvm::FixedPointSemantics::GetIntegerSemantics(
+            value->getType()->getScalarSizeInBits(), /*IsSigned=*/true);
+    auto DstSema = CGF.getContext().getFixedPointSemantics(Info.Ty);
     Info.RHS = EmitFixedPointConversion(Info.RHS, SrcSema, DstSema,
                                         E->getExprLoc());
     value = EmitFixedPointBinOp(Info);
@@ -2749,7 +2735,7 @@ Value *ScalarExprEmitter::VisitUnaryMinus(const UnaryOperator *E) {
   BinOp.LHS = llvm::Constant::getNullValue(BinOp.RHS->getType());
   BinOp.Ty = E->getType();
   BinOp.Opcode = BO_Sub;
-  BinOp.FPFeatures = E->getFPFeatures(CGF.getLangOpts());
+  BinOp.FPFeatures = E->getFPFeaturesInEffect(CGF.getLangOpts());
   BinOp.E = E;
   return EmitSub(BinOp);
 }
@@ -2769,9 +2755,8 @@ Value *ScalarExprEmitter::VisitUnaryLNot(const UnaryOperator *E) {
     Value *Zero = llvm::Constant::getNullValue(Oper->getType());
     Value *Result;
     if (Oper->getType()->isFPOrFPVectorTy()) {
-      llvm::IRBuilder<>::FastMathFlagGuard FMFG(Builder);
-      setBuilderFlagsFromFPFeatures(Builder, CGF,
-                                    E->getFPFeatures(CGF.getLangOpts()));
+      CodeGenFunction::CGFPOptionsRAII FPOptsRAII(
+          CGF, E->getFPFeaturesInEffect(CGF.getLangOpts()));
       Result = Builder.CreateFCmp(llvm::CmpInst::FCMP_OEQ, Oper, Zero, "cmp");
     } else
       Result = Builder.CreateICmp(llvm::CmpInst::ICMP_EQ, Oper, Zero, "cmp");
@@ -2974,7 +2959,7 @@ BinOpInfo ScalarExprEmitter::EmitBinOps(const BinaryOperator *E) {
   Result.RHS = Visit(E->getRHS());
   Result.Ty  = E->getType();
   Result.Opcode = E->getOpcode();
-  Result.FPFeatures = E->getFPFeatures(CGF.getLangOpts());
+  Result.FPFeatures = E->getFPFeaturesInEffect(CGF.getLangOpts());
   Result.E = E;
   return Result;
 }
@@ -2994,7 +2979,7 @@ LValue ScalarExprEmitter::EmitCompoundAssignLValue(
   OpInfo.RHS = Visit(E->getRHS());
   OpInfo.Ty = E->getComputationResultType();
   OpInfo.Opcode = E->getOpcode();
-  OpInfo.FPFeatures = E->getFPFeatures(CGF.getLangOpts());
+  OpInfo.FPFeatures = E->getFPFeaturesInEffect(CGF.getLangOpts());
   OpInfo.E = E;
   // Load/convert the LHS.
   LValue LHSLV = EmitCheckedLValue(E->getLHS(), CodeGenFunction::TCK_Store);
@@ -3183,8 +3168,7 @@ Value *ScalarExprEmitter::EmitDiv(const BinOpInfo &Ops) {
 
   if (Ops.LHS->getType()->isFPOrFPVectorTy()) {
     llvm::Value *Val;
-    llvm::IRBuilder<>::FastMathFlagGuard FMFG(Builder);
-    setBuilderFlagsFromFPFeatures(Builder, CGF, Ops.FPFeatures);
+    CodeGenFunction::CGFPOptionsRAII FPOptsRAII(CGF, Ops.FPFeatures);
     Val = Builder.CreateFDiv(Ops.LHS, Ops.RHS, "div");
     if (CGF.getLangOpts().OpenCL &&
         !CGF.CGM.getCodeGenOpts().CorrectlyRoundedDivSqrt) {
@@ -3562,8 +3546,7 @@ Value *ScalarExprEmitter::EmitAdd(const BinOpInfo &op) {
     return EmitOverflowCheckedBinOp(op);
 
   if (op.LHS->getType()->isFPOrFPVectorTy()) {
-    llvm::IRBuilder<>::FastMathFlagGuard FMFG(Builder);
-    setBuilderFlagsFromFPFeatures(Builder, CGF, op.FPFeatures);
+    CodeGenFunction::CGFPOptionsRAII FPOptsRAII(CGF, op.FPFeatures);
     // Try to form an fmuladd.
     if (Value *FMulAdd = tryEmitFMulAdd(op, CGF, Builder))
       return FMulAdd;
@@ -3624,8 +3607,8 @@ Value *ScalarExprEmitter::EmitFixedPointBinOp(const BinOpInfo &op) {
   switch (op.Opcode) {
   case BO_AddAssign:
   case BO_Add: {
-    if (ResultFixedSema.isSaturated()) {
-      llvm::Intrinsic::ID IID = ResultFixedSema.isSigned()
+    if (CommonFixedSema.isSaturated()) {
+      llvm::Intrinsic::ID IID = CommonFixedSema.isSigned()
                                     ? llvm::Intrinsic::sadd_sat
                                     : llvm::Intrinsic::uadd_sat;
       Result = Builder.CreateBinaryIntrinsic(IID, FullLHS, FullRHS);
@@ -3636,8 +3619,8 @@ Value *ScalarExprEmitter::EmitFixedPointBinOp(const BinOpInfo &op) {
   }
   case BO_SubAssign:
   case BO_Sub: {
-    if (ResultFixedSema.isSaturated()) {
-      llvm::Intrinsic::ID IID = ResultFixedSema.isSigned()
+    if (CommonFixedSema.isSaturated()) {
+      llvm::Intrinsic::ID IID = CommonFixedSema.isSigned()
                                     ? llvm::Intrinsic::ssub_sat
                                     : llvm::Intrinsic::usub_sat;
       Result = Builder.CreateBinaryIntrinsic(IID, FullLHS, FullRHS);
@@ -3649,14 +3632,12 @@ Value *ScalarExprEmitter::EmitFixedPointBinOp(const BinOpInfo &op) {
   case BO_MulAssign:
   case BO_Mul: {
     llvm::Intrinsic::ID IID;
-    if (ResultFixedSema.isSaturated())
-      IID = ResultFixedSema.isSigned()
-                ? llvm::Intrinsic::smul_fix_sat
-                : llvm::Intrinsic::umul_fix_sat;
+    if (CommonFixedSema.isSaturated())
+      IID = CommonFixedSema.isSigned() ? llvm::Intrinsic::smul_fix_sat
+                                       : llvm::Intrinsic::umul_fix_sat;
     else
-      IID = ResultFixedSema.isSigned()
-                ? llvm::Intrinsic::smul_fix
-                : llvm::Intrinsic::umul_fix;
+      IID = CommonFixedSema.isSigned() ? llvm::Intrinsic::smul_fix
+                                       : llvm::Intrinsic::umul_fix;
     Result = Builder.CreateIntrinsic(IID, {FullLHS->getType()},
         {FullLHS, FullRHS, Builder.getInt32(CommonFixedSema.getScale())});
     break;
@@ -3664,11 +3645,11 @@ Value *ScalarExprEmitter::EmitFixedPointBinOp(const BinOpInfo &op) {
   case BO_DivAssign:
   case BO_Div: {
     llvm::Intrinsic::ID IID;
-    if (ResultFixedSema.isSaturated())
-      IID = ResultFixedSema.isSigned() ? llvm::Intrinsic::sdiv_fix_sat
+    if (CommonFixedSema.isSaturated())
+      IID = CommonFixedSema.isSigned() ? llvm::Intrinsic::sdiv_fix_sat
                                        : llvm::Intrinsic::udiv_fix_sat;
     else
-      IID = ResultFixedSema.isSigned() ? llvm::Intrinsic::sdiv_fix
+      IID = CommonFixedSema.isSigned() ? llvm::Intrinsic::sdiv_fix
                                        : llvm::Intrinsic::udiv_fix;
     Result = Builder.CreateIntrinsic(IID, {FullLHS->getType()},
         {FullLHS, FullRHS, Builder.getInt32(CommonFixedSema.getScale())});
@@ -3750,8 +3731,7 @@ Value *ScalarExprEmitter::EmitSub(const BinOpInfo &op) {
       return EmitOverflowCheckedBinOp(op);
 
     if (op.LHS->getType()->isFPOrFPVectorTy()) {
-      llvm::IRBuilder<>::FastMathFlagGuard FMFG(Builder);
-      setBuilderFlagsFromFPFeatures(Builder, CGF, op.FPFeatures);
+      CodeGenFunction::CGFPOptionsRAII FPOptsRAII(CGF, op.FPFeatures);
       // Try to form an fmuladd.
       if (Value *FMulAdd = tryEmitFMulAdd(op, CGF, Builder, true))
         return FMulAdd;
@@ -4077,8 +4057,7 @@ Value *ScalarExprEmitter::EmitCompare(const BinaryOperator *E,
     if (BOInfo.isFixedPointOp()) {
       Result = EmitFixedPointBinOp(BOInfo);
     } else if (LHS->getType()->isFPOrFPVectorTy()) {
-      llvm::IRBuilder<>::FastMathFlagGuard FMFG(Builder);
-      setBuilderFlagsFromFPFeatures(Builder, CGF, BOInfo.FPFeatures);
+      CodeGenFunction::CGFPOptionsRAII FPOptsRAII(CGF, BOInfo.FPFeatures);
       if (!IsSignaling)
         Result = Builder.CreateFCmp(FCmpOpc, LHS, RHS, "cmp");
       else
@@ -4231,9 +4210,8 @@ Value *ScalarExprEmitter::VisitBinLAnd(const BinaryOperator *E) {
     Value *RHS = Visit(E->getRHS());
     Value *Zero = llvm::ConstantAggregateZero::get(LHS->getType());
     if (LHS->getType()->isFPOrFPVectorTy()) {
-      llvm::IRBuilder<>::FastMathFlagGuard FMFG(Builder);
-      setBuilderFlagsFromFPFeatures(Builder, CGF,
-                                    E->getFPFeatures(CGF.getLangOpts()));
+      CodeGenFunction::CGFPOptionsRAII FPOptsRAII(
+          CGF, E->getFPFeaturesInEffect(CGF.getLangOpts()));
       LHS = Builder.CreateFCmp(llvm::CmpInst::FCMP_UNE, LHS, Zero, "cmp");
       RHS = Builder.CreateFCmp(llvm::CmpInst::FCMP_UNE, RHS, Zero, "cmp");
     } else {
@@ -4318,9 +4296,8 @@ Value *ScalarExprEmitter::VisitBinLOr(const BinaryOperator *E) {
     Value *RHS = Visit(E->getRHS());
     Value *Zero = llvm::ConstantAggregateZero::get(LHS->getType());
     if (LHS->getType()->isFPOrFPVectorTy()) {
-      llvm::IRBuilder<>::FastMathFlagGuard FMFG(Builder);
-      setBuilderFlagsFromFPFeatures(Builder, CGF,
-                                    E->getFPFeatures(CGF.getLangOpts()));
+      CodeGenFunction::CGFPOptionsRAII FPOptsRAII(
+          CGF, E->getFPFeaturesInEffect(CGF.getLangOpts()));
       LHS = Builder.CreateFCmp(llvm::CmpInst::FCMP_UNE, LHS, Zero, "cmp");
       RHS = Builder.CreateFCmp(llvm::CmpInst::FCMP_UNE, RHS, Zero, "cmp");
     } else {

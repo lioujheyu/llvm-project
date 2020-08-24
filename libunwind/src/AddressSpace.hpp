@@ -39,13 +39,6 @@ struct EHABIIndexEntry {
 };
 #endif
 
-#ifdef __APPLE__
-#include <mach-o/getsect.h>
-namespace libunwind {
-   bool checkKeyMgrRegisteredFDEs(uintptr_t targetAddr, void *&fde);
-}
-#endif
-
 #include "libunwind.h"
 #include "config.h"
 #include "dwarf2.h"
@@ -62,43 +55,9 @@ namespace libunwind {
     const void*                 compact_unwind_section;
     uintptr_t                   compact_unwind_section_length;
   };
-  #if (defined(__MAC_OS_X_VERSION_MIN_REQUIRED) \
-                                 && (__MAC_OS_X_VERSION_MIN_REQUIRED >= 1070)) \
-      || defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
-    // In 10.7.0 or later, libSystem.dylib implements this function.
-    extern "C" bool _dyld_find_unwind_sections(void *, dyld_unwind_sections *);
-  #else
-    // In 10.6.x and earlier, we need to implement this functionality. Note
-    // that this requires a newer version of libmacho (from cctools) than is
-    // present in libSystem on 10.6.x (for getsectiondata).
-    static inline bool _dyld_find_unwind_sections(void* addr,
-                                                    dyld_unwind_sections* info) {
-      // Find mach-o image containing address.
-      Dl_info dlinfo;
-      if (!dladdr(addr, &dlinfo))
-        return false;
-#if __LP64__
-      const struct mach_header_64 *mh = (const struct mach_header_64 *)dlinfo.dli_fbase;
-#else
-      const struct mach_header *mh = (const struct mach_header *)dlinfo.dli_fbase;
-#endif
 
-      // Initialize the return struct
-      info->mh = (const struct mach_header *)mh;
-      info->dwarf_section = getsectiondata(mh, "__TEXT", "__eh_frame", &info->dwarf_section_length);
-      info->compact_unwind_section = getsectiondata(mh, "__TEXT", "__unwind_info", &info->compact_unwind_section_length);
-
-      if (!info->dwarf_section) {
-        info->dwarf_section_length = 0;
-      }
-
-      if (!info->compact_unwind_section) {
-        info->compact_unwind_section_length = 0;
-      }
-
-      return true;
-    }
-  #endif
+  // In 10.7.0 or later, libSystem.dylib implements this function.
+  extern "C" bool _dyld_find_unwind_sections(void *, dyld_unwind_sections *);
 
 #elif defined(_LIBUNWIND_SUPPORT_DWARF_UNWIND) && defined(_LIBUNWIND_IS_BAREMETAL)
 
@@ -290,11 +249,11 @@ inline int64_t LocalAddressSpace::getSLEB128(pint_t &addr, pint_t end) {
     if (p == pend)
       _LIBUNWIND_ABORT("truncated sleb128 expression");
     byte = *p++;
-    result |= ((byte & 0x7f) << bit);
+    result |= (uint64_t)(byte & 0x7f) << bit;
     bit += 7;
   } while (byte & 0x80);
   // sign extend negative numbers
-  if ((byte & 0x40) != 0)
+  if ((byte & 0x40) != 0 && bit < 64)
     result |= (-1ULL) << bit;
   addr = (pint_t) p;
   return result;
@@ -452,10 +411,12 @@ struct _LIBUNWIND_HIDDEN dl_iterate_cb_data {
     #error "_LIBUNWIND_SUPPORT_DWARF_UNWIND requires _LIBUNWIND_SUPPORT_DWARF_INDEX on this platform."
   #endif
 
+#if defined(_LIBUNWIND_USE_FRAME_HEADER_CACHE)
 #include "FrameHeaderCache.hpp"
 
 // There should be just one of these per process.
 static FrameHeaderCache ProcessFrameHeaderCache;
+#endif
 
 static bool checkAddrInSegment(const Elf_Phdr *phdr, size_t image_base,
                                dl_iterate_cb_data *cbdata) {
@@ -471,13 +432,15 @@ static bool checkAddrInSegment(const Elf_Phdr *phdr, size_t image_base,
   return false;
 }
 
-int findUnwindSectionsByPhdr(struct dl_phdr_info *pinfo, size_t pinfo_size,
-                             void *data) {
+static int findUnwindSectionsByPhdr(struct dl_phdr_info *pinfo,
+                                    size_t pinfo_size, void *data) {
   auto cbdata = static_cast<dl_iterate_cb_data *>(data);
   if (pinfo->dlpi_phnum == 0 || cbdata->targetAddr < pinfo->dlpi_addr)
     return 0;
+#if defined(_LIBUNWIND_USE_FRAME_HEADER_CACHE)
   if (ProcessFrameHeaderCache.find(pinfo, pinfo_size, data))
     return 1;
+#endif
 
   Elf_Addr image_base = calculateImageBase(pinfo);
   bool found_obj = false;
@@ -505,7 +468,9 @@ int findUnwindSectionsByPhdr(struct dl_phdr_info *pinfo, size_t pinfo_size,
       found_obj = checkAddrInSegment(phdr, image_base, cbdata);
     }
     if (found_obj && found_hdr) {
+#if defined(_LIBUNWIND_USE_FRAME_HEADER_CACHE)
       ProcessFrameHeaderCache.add(cbdata->sects);
+#endif
       return 1;
     }
   }
@@ -517,7 +482,8 @@ int findUnwindSectionsByPhdr(struct dl_phdr_info *pinfo, size_t pinfo_size,
 // Given all the #ifdef's above, the code here is for
 // defined(LIBUNWIND_ARM_EHABI)
 
-int findUnwindSectionsByPhdr(struct dl_phdr_info *pinfo, size_t, void *data) {
+static int findUnwindSectionsByPhdr(struct dl_phdr_info *pinfo, size_t,
+                                    void *data) {
   auto *cbdata = static_cast<dl_iterate_cb_data *>(data);
   bool found_obj = false;
   bool found_hdr = false;
@@ -651,14 +617,10 @@ inline bool LocalAddressSpace::findUnwindSections(pint_t targetAddr,
 
 
 inline bool LocalAddressSpace::findOtherFDE(pint_t targetAddr, pint_t &fde) {
-#ifdef __APPLE__
-  return checkKeyMgrRegisteredFDEs(targetAddr, *((void**)&fde));
-#else
   // TO DO: if OS has way to dynamically register FDEs, check that.
   (void)targetAddr;
   (void)fde;
   return false;
-#endif
 }
 
 inline bool LocalAddressSpace::findFunctionName(pint_t addr, char *buf,

@@ -91,6 +91,7 @@ public:
   std::chrono::seconds GetUtilityExpressionTimeout() const;
   bool GetOSPluginReportsAllThreads() const;
   void SetOSPluginReportsAllThreads(bool does_report);
+  bool GetSteppingRunsAllThreads() const;
 
 protected:
   Process *m_process; // Can be nullptr for global ProcessProperties
@@ -326,7 +327,7 @@ public:
   }
 
   void SetStopEventForLastNaturalStopID(lldb::EventSP event_sp) {
-    m_last_natural_stop_event = event_sp;
+    m_last_natural_stop_event = std::move(event_sp);
   }
 
   lldb::EventSP GetStopEventForStopID(uint32_t stop_id) const {
@@ -451,6 +452,8 @@ public:
     bool GetInterrupted() const { return m_interrupted; }
 
     void Dump(Stream *s) const override;
+
+    virtual bool ShouldStop(Event *event_ptr, bool &found_valid_stopinfo);
 
     void DoOnRemoval(Event *event_ptr) override;
 
@@ -725,21 +728,22 @@ public:
 
   /// Attach to a remote system via a URL
   ///
-  /// \param[in] strm
-  ///     A stream where output intended for the user
-  ///     (if the driver has a way to display that) generated during
-  ///     the connection.  This may be nullptr if no output is needed.A
-  ///
   /// \param[in] remote_url
   ///     The URL format that we are connecting to.
   ///
   /// \return
   ///     Returns an error object.
-  virtual Status ConnectRemote(Stream *strm, llvm::StringRef remote_url);
+  virtual Status ConnectRemote(llvm::StringRef remote_url);
 
   bool GetShouldDetach() const { return m_should_detach; }
 
   void SetShouldDetach(bool b) { m_should_detach = b; }
+
+  /// Get the image vector for the current process.
+  ///
+  /// \return
+  ///     The constant reference to the member m_image_tokens.
+  const std::vector<lldb::addr_t>& GetImageTokens() { return m_image_tokens; }
 
   /// Get the image information address for the current process.
   ///
@@ -913,17 +917,12 @@ public:
 
   /// Attach to a remote system via a URL
   ///
-  /// \param[in] strm
-  ///     A stream where output intended for the user
-  ///     (if the driver has a way to display that) generated during
-  ///     the connection.  This may be nullptr if no output is needed.A
-  ///
   /// \param[in] remote_url
   ///     The URL format that we are connecting to.
   ///
   /// \return
   ///     Returns an error object.
-  virtual Status DoConnectRemote(Stream *strm, llvm::StringRef remote_url) {
+  virtual Status DoConnectRemote(llvm::StringRef remote_url) {
     Status error;
     error.SetErrorString("remote connections are not supported");
     return error;
@@ -1329,7 +1328,6 @@ public:
 
   virtual bool GetProcessInfo(ProcessInstanceInfo &info);
 
-public:
   /// Get the exit status for a process.
   ///
   /// \return
@@ -2162,7 +2160,7 @@ public:
   public:
     ProcessEventHijacker(Process &process, lldb::ListenerSP listener_sp)
         : m_process(process) {
-      m_process.HijackProcessEvents(listener_sp);
+      m_process.HijackProcessEvents(std::move(listener_sp));
     }
 
     ~ProcessEventHijacker() { m_process.RestoreProcessEvents(); }
@@ -2237,7 +2235,7 @@ void PruneThreadPlans();
 
   /// Dump the thread plans associated with thread with \a tid.
   ///
-  /// \param[in/out] strm
+  /// \param[in,out] strm
   ///     The stream to which to dump the output
   ///
   /// \param[in] tid
@@ -2264,7 +2262,7 @@ void PruneThreadPlans();
 
   /// Dump all the thread plans for this process.
   ///
-  /// \param[in/out] strm
+  /// \param[in,out] strm
   ///     The stream to which to dump the output
   ///
   /// \param[in] desc_level

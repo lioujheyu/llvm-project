@@ -548,6 +548,8 @@ bool StructType::indexValid(const Value *V) const {
   // vector case all of the indices must be equal.
   if (!V->getType()->isIntOrIntVectorTy(32))
     return false;
+  if (isa<ScalableVectorType>(V->getType()))
+    return false;
   const Constant *C = dyn_cast<Constant>(V);
   if (C && V->getType()->isVectorTy())
     C = C->getSplatValue();
@@ -617,7 +619,7 @@ FixedVectorType *FixedVectorType::get(Type *ElementType, unsigned NumElts) {
                                             "be an integer, floating point, or "
                                             "pointer type.");
 
-  ElementCount EC(NumElts, false);
+  auto EC = ElementCount::getFixed(NumElts);
 
   LLVMContextImpl *pImpl = ElementType->getContext().pImpl;
   VectorType *&Entry = ElementType->getContext()
@@ -639,7 +641,7 @@ ScalableVectorType *ScalableVectorType::get(Type *ElementType,
                                             "be an integer, floating point, or "
                                             "pointer type.");
 
-  ElementCount EC(MinNumElts, true);
+  auto EC = ElementCount::getScalable(MinNumElts);
 
   LLVMContextImpl *pImpl = ElementType->getContext().pImpl;
   VectorType *&Entry = ElementType->getContext()

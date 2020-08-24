@@ -20,17 +20,22 @@
 #include <optional>
 #include <string>
 
-// IsDescriptor() predicate
-// TODO there's probably a better place for this predicate than here
+// IsDescriptor() predicate: true when a symbol is implemented
+// at runtime with a descriptor.
 namespace Fortran::semantics {
 
-static bool IsDescriptor(const ObjectEntityDetails &details) {
-  if (const auto *type{details.type()}) {
+static bool IsDescriptor(const DeclTypeSpec *type) {
+  if (type) {
     if (auto dynamicType{evaluate::DynamicType::From(*type)}) {
-      if (dynamicType->RequiresDescriptor()) {
-        return true;
-      }
+      return dynamicType->RequiresDescriptor();
     }
+  }
+  return false;
+}
+
+static bool IsDescriptor(const ObjectEntityDetails &details) {
+  if (IsDescriptor(details.type())) {
+    return true;
   }
   // TODO: Automatic (adjustable) arrays - are they descriptors?
   for (const ShapeSpec &shapeSpec : details.shape()) {
@@ -61,6 +66,7 @@ bool IsDescriptor(const Symbol &symbol) {
                        symbol.attrs().test(Attr::EXTERNAL)) &&
                 IsDescriptor(d);
           },
+          [&](const EntityDetails &d) { return IsDescriptor(d.type()); },
           [](const AssocEntityDetails &d) {
             if (const auto &expr{d.expr()}) {
               if (expr->Rank() > 0) {
@@ -97,12 +103,54 @@ bool DynamicType::operator==(const DynamicType &that) const {
       PointeeComparison(derived_, that.derived_);
 }
 
-std::optional<common::ConstantSubscript> DynamicType::GetCharLength() const {
-  if (category_ == TypeCategory::Character && charLength_ &&
-      charLength_->isExplicit()) {
-    if (const auto &len{charLength_->GetExplicit()}) {
-      return ToInt64(len);
+std::optional<Expr<SubscriptInteger>> DynamicType::GetCharLength() const {
+  if (category_ == TypeCategory::Character && charLength_) {
+    if (auto length{charLength_->GetExplicit()}) {
+      return ConvertToType<SubscriptInteger>(std::move(*length));
     }
+  }
+  return std::nullopt;
+}
+
+static constexpr int RealKindBytes(int kind) {
+  switch (kind) {
+  case 3: // non-IEEE 16-bit format (truncated 32-bit)
+    return 2;
+  case 10: // 80387 80-bit extended precision
+  case 12: // possible variant spelling
+    return 16;
+  default:
+    return kind;
+  }
+}
+
+std::optional<Expr<SubscriptInteger>> DynamicType::MeasureSizeInBytes(
+    FoldingContext *context) const {
+  switch (category_) {
+  case TypeCategory::Integer:
+    return Expr<SubscriptInteger>{kind_};
+  case TypeCategory::Real:
+    return Expr<SubscriptInteger>{RealKindBytes(kind_)};
+  case TypeCategory::Complex:
+    return Expr<SubscriptInteger>{2 * RealKindBytes(kind_)};
+  case TypeCategory::Character:
+    if (auto len{GetCharLength()}) {
+      auto result{Expr<SubscriptInteger>{kind_} * std::move(*len)};
+      if (context) {
+        return Fold(*context, std::move(result));
+      } else {
+        return std::move(result);
+      }
+    }
+    break;
+  case TypeCategory::Logical:
+    return Expr<SubscriptInteger>{kind_};
+  case TypeCategory::Derived:
+    if (derived_ && derived_->scope()) {
+      return Expr<SubscriptInteger>{
+          static_cast<common::ConstantSubscript>(derived_->scope()->size())};
+    }
+    break;
   }
   return std::nullopt;
 }
@@ -112,7 +160,7 @@ bool DynamicType::IsAssumedLengthCharacter() const {
       charLength_->isAssumed();
 }
 
-bool DynamicType::IsUnknownLengthCharacter() const {
+bool DynamicType::IsNonConstantLengthCharacter() const {
   if (category_ != TypeCategory::Character) {
     return false;
   } else if (!charLength_) {
@@ -434,8 +482,8 @@ DynamicType DynamicType::ResultTypeForMultiply(const DynamicType &that) const {
 }
 
 bool DynamicType::RequiresDescriptor() const {
-  return IsPolymorphic() || IsUnknownLengthCharacter() ||
-      (derived_ && CountLenParameters(*derived_) > 0);
+  return IsPolymorphic() || IsNonConstantLengthCharacter() ||
+      (derived_ && CountNonConstantLenParameters(*derived_) > 0);
 }
 
 bool DynamicType::HasDeferredTypeParameter() const {
