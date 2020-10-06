@@ -10,8 +10,17 @@
 #define MLIR_BINDINGS_PYTHON_PYBINDUTILS_H
 
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 
+#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/Twine.h"
+
+namespace pybind11 {
+namespace detail {
+template <typename T>
+struct type_caster<llvm::Optional<T>> : optional_caster<llvm::Optional<T>> {};
+} // namespace detail
+} // namespace pybind11
 
 namespace mlir {
 namespace python {
@@ -20,7 +29,8 @@ namespace python {
 // python runtime.
 // Correct usage:
 //   throw SetPyError(PyExc_ValueError, "Foobar'd");
-pybind11::error_already_set SetPyError(PyObject *excClass, llvm::Twine message);
+pybind11::error_already_set SetPyError(PyObject *excClass,
+                                       const llvm::Twine &message);
 
 } // namespace python
 } // namespace mlir
