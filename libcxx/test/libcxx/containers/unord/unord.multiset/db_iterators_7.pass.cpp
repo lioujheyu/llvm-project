@@ -10,24 +10,17 @@
 
 // Increment iterator past end.
 
-// This test requires debug mode, which the library on macOS doesn't have.
-// UNSUPPORTED: with_system_cxx_lib=macosx
+// UNSUPPORTED: libcxx-no-debug-mode
 
-#define _LIBCPP_DEBUG 1
+// ADDITIONAL_COMPILE_FLAGS: -D_LIBCPP_DEBUG=1
 #define _LIBCPP_ASSERT(x, m) ((x) ? (void)0 : std::exit(0))
 
 #include <unordered_set>
 #include <cassert>
-#include <iterator>
-#include <exception>
-#include <cstdlib>
 
 #include "test_macros.h"
-#include "min_allocator.h"
 
-int main(int, char**)
-{
-    {
+int main(int, char**) {
     typedef int T;
     typedef std::unordered_multiset<T> C;
     C c(1);
@@ -36,17 +29,6 @@ int main(int, char**)
     assert(i == c.end());
     ++i;
     assert(false);
-    }
-#if TEST_STD_VER >= 11
-    {
-    typedef int T;
-    typedef std::unordered_multiset<T, std::hash<T>, std::equal_to<T>, min_allocator<T>> C;
-    C c(1);
-    C::iterator i = c.begin();
-    ++i;
-    assert(i == c.end());
-    ++i;
-    assert(false);
-    }
-#endif
+
+    return 0;
 }

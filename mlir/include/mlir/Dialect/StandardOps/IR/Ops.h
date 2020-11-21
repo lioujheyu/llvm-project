@@ -301,21 +301,23 @@ public:
   LogicalResult verify();
 };
 
-/// Prints dimension and symbol list.
-void printDimAndSymbolList(Operation::operand_iterator begin,
-                           Operation::operand_iterator end, unsigned numDims,
-                           OpAsmPrinter &p);
-
-/// Parses dimension and symbol list and returns true if parsing failed.
-ParseResult parseDimAndSymbolList(OpAsmParser &parser,
-                                  SmallVectorImpl<Value> &operands,
-                                  unsigned &numDims);
+/// Given an `originalShape` and a `reducedShape` assumed to be a subset of
+/// `originalShape` with some `1` entries erased, return the vector of booleans
+/// that specifies which of the entries of `originalShape` are keep to obtain
+/// `reducedShape`. The returned mask can be applied as a projection to
+/// `originalShape` to obtain the `reducedShape`. This mask is useful to track
+/// which dimensions must be kept when e.g. compute MemRef strides under
+/// rank-reducing operations. Return None if reducedShape cannot be obtained
+/// by dropping only `1` entries in `originalShape`.
+llvm::Optional<SmallVector<bool, 4>>
+computeRankReductionMask(ArrayRef<int64_t> originalShape,
+                         ArrayRef<int64_t> reducedShape);
 
 /// Determines whether MemRefCastOp casts to a more dynamic version of the
 /// source memref. This is useful to to fold a memref_cast into a consuming op
 /// and implement canonicalization patterns for ops in different dialects that
 /// may consume the results of memref_cast operations. Such foldable memref_cast
-/// operations are typically inserted as `view` and `subview` ops are
+/// operations are typically inserted as `view` and `subview` ops and are
 /// canonicalized, to preserve the type compatibility of their uses.
 ///
 /// Returns true when all conditions are met:

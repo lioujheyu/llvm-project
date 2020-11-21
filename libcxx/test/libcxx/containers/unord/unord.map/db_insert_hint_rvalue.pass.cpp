@@ -14,10 +14,9 @@
 //           class = typename enable_if<is_convertible<P, value_type>::value>::type>
 //     iterator insert(const_iterator p, P&& x);
 
-// This test requires debug mode, which the library on macOS doesn't have.
-// UNSUPPORTED: with_system_cxx_lib=macosx
+// UNSUPPORTED: libcxx-no-debug-mode
 
-#define _LIBCPP_DEBUG 1
+// ADDITIONAL_COMPILE_FLAGS: -D_LIBCPP_DEBUG=1
 #define _LIBCPP_ASSERT(x, m) ((x) ? (void)0 : std::exit(0))
 
 #include <unordered_map>
@@ -25,18 +24,15 @@
 
 #include "test_macros.h"
 
-int main(int, char**)
-{
-    {
-        typedef std::unordered_map<double, int> C;
-        typedef C::iterator R;
-        typedef C::value_type P;
-        C c;
-        C c2;
-        C::const_iterator e = c2.end();
-        R r = c.insert(e, P(3.5, 3));
-        assert(false);
-    }
+int main(int, char**) {
+    typedef std::unordered_map<double, int> C;
+    typedef C::iterator R;
+    typedef C::value_type P;
+    C c;
+    C c2;
+    C::const_iterator e = c2.end();
+    R r = c.insert(e, P(3.5, 3));
+    assert(false);
 
     return 0;
 }

@@ -12,10 +12,9 @@
 
 // unordered_multiset(unordered_multiset&& u);
 
-// This test requires debug mode, which the library on macOS doesn't have.
-// UNSUPPORTED: with_system_cxx_lib=macosx
+// UNSUPPORTED: libcxx-no-debug-mode
 
-#define _LIBCPP_DEBUG 1
+// ADDITIONAL_COMPILE_FLAGS: -D_LIBCPP_DEBUG=1
 #define _LIBCPP_ASSERT(x, m) ((x) ? (void)0 : std::exit(0))
 
 #include <unordered_set>
@@ -24,17 +23,14 @@
 
 #include "test_macros.h"
 
-int main(int, char**)
-{
-    {
-        std::unordered_multiset<int> s1 = {1, 2, 3};
-        std::unordered_multiset<int>::iterator i = s1.begin();
-        int k = *i;
-        std::unordered_multiset<int> s2 = std::move(s1);
-        assert(*i == k);
-        s2.erase(i);
-        assert(s2.size() == 2);
-    }
+int main(int, char**) {
+    std::unordered_multiset<int> s1 = {1, 2, 3};
+    std::unordered_multiset<int>::iterator i = s1.begin();
+    int k = *i;
+    std::unordered_multiset<int> s2 = std::move(s1);
+    assert(*i == k);
+    s2.erase(i);
+    assert(s2.size() == 2);
 
     return 0;
 }
